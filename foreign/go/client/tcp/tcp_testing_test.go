@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
 )
@@ -244,6 +245,24 @@ func (s *fakeServer) recorded() []request {
 	return append([]request(nil), s.requests...)
 }
 
+func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index int, read request) []byte) *fakeServer {
+	t.Helper()
+	return serve(conn, func(index int, read request) []byte {
+		switch read.code() {
+		case uint32(command.GetSendContextCode):
+			body := make([]byte, 0, iggcon.PartitionContextSize)
+			for _, field := range []uint64{17, 0, 0, 100} {
+				body = binary.LittleEndian.AppendUint64(body, field)
+			}
+			return replyFrame(vsr.OperationNonReplicated, body)
+		case uint32(command.GetPollRoutingCode), uint32(command.GetOffsetRoutingCode):
+			return pollRoutingReply(t, read, "127.0.0.1:8090", read.sessionID())
+		default:
+			return handler(index, read)
+		}
+	})
+}
+
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a
 // session already bound so replicated commands encode.
 func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
@@ -254,6 +273,7 @@ func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 	client.session.BeginRegister()
 	require.NoError(t, client.session.Bind(100))
 	client.sessionState = iggcon.SessionStateAuthenticated
+	client.rememberLogin(NewUsernamePasswordCredentials("iggy", "secret"))
 
 	t.Cleanup(func() {
 		_ = clientConn.Close()

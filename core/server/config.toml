@@ -763,6 +763,8 @@ poll_completion_capacity = 1024
 
 # Active partition file jobs plus results awaiting owner acceptance per shard (1..=256).
 # Exhausting either limit queues partition file work until capacity is released.
+# Running jobs use [cluster] superblock_wedged_fatal_timeout, counted in pump ticks.
+# Expiry fences the owner and stops the node; 0 disables this deadline.
 partition_io_capacity = 16
 # Omission selects the largest legal job charge, slightly above 4 GiB per shard.
 # This is an admission ceiling, not an eager allocation. A smaller budget fails boot.

@@ -36,6 +36,7 @@ internal enum VsrOperation : byte
     CompleteConsumerGroupRevocation = 67,
     TruncatePartition = 68,
     FinalizeSession = 70,
+    CompleteLifecycle = 71,
 
     CreateStream = 128,
     UpdateStream = 129,
@@ -63,7 +64,10 @@ internal enum VsrOperation : byte
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    RetireSession = 166
+    RetireSession = 166,
+    InstallConsumerGroupOwner = 167,
+    TransitionPartitionHistory = 168,
+    RetireConsumerGroupOwners = 169
 }
 
 internal static class VsrOperations
@@ -95,7 +99,9 @@ internal static class VsrOperations
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,
-        CommandCodes.GET_POLL_ROUTING_CODE
+        CommandCodes.GET_POLL_ROUTING_CODE,
+        CommandCodes.GET_SEND_CONTEXT_CODE,
+        CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE
     ];
 
     /// <summary>
@@ -191,7 +197,8 @@ internal static class VsrOperations
             VsrOperation.Reserved or VsrOperation.Register or VsrOperation.NonReplicated or VsrOperation.Logout =>
                 true,
             >= VsrOperation.CreateTopicWithAssignments and <= VsrOperation.TruncatePartition => true,
-            VsrOperation.FinalizeSession or VsrOperation.RetireSession => true,
+            VsrOperation.FinalizeSession or VsrOperation.CompleteLifecycle or VsrOperation.RetireSession
+                or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners => true,
             >= VsrOperation.CreateStream and <= VsrOperation.LeaveConsumerGroup => true,
             VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset =>
                 true,
@@ -203,7 +210,7 @@ internal static class VsrOperations
     internal static bool IsInternal(this VsrOperation operation)
     {
         return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
-            || operation == VsrOperation.RetireSession;
+            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners;
     }
 
     /// <summary>

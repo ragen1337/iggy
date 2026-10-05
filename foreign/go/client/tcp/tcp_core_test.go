@@ -399,7 +399,7 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 	confirmations = binary.LittleEndian.AppendUint32(confirmations, 2)
 	confirmations = binary.LittleEndian.AppendUint32(confirmations, 1)
 	confirmations = binary.LittleEndian.AppendUint64(confirmations, 42)
-	server := serve(serverConn, func(_ int, _ request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationSendMessages, confirmations)
 	})
 
@@ -415,17 +415,18 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 	}, response.Confirmations)
 
 	recorded := server.recorded()
-	require.Len(t, recorded, 1)
-	assert.Equal(t, vsr.OperationSendMessages, recorded[0].operation())
-	assert.Equal(t, uint32(1), recorded[0].partitionID(t))
-	assert.Equal(t, uint64(1), recorded[0].requestID(),
+	require.Len(t, recorded, 2)
+	assert.Equal(t, uint32(command.GetSendContextCode), recorded[0].code())
+	assert.Equal(t, vsr.OperationSendMessages, recorded[1].operation())
+	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
+	assert.Equal(t, uint64(1), recorded[1].requestID(),
 		"a partition request reads the watermark without consuming it")
 }
 
 func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	client.config.reconnection.enabled = false
-	serve(serverConn, func(_ int, _ request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		// The server answers a replicated request on a dead session with an
 		// empty status-0 reply. Nothing was written, so reading it as a
 		// successful send would silently drop the batch.
@@ -442,7 +443,7 @@ func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 
 func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 	})
 
@@ -462,7 +463,7 @@ func zeroConfirmations() []byte {
 
 func TestSendMessages_DegradesAnUnreadableConfirmationBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		// The batch already committed, so a decode failure must not surface as
 		// an error a caller would retry into a duplicate write.
 		return replyFrame(vsr.OperationSendMessages, []byte{1, 0, 0, 0, 0xFF})
@@ -479,7 +480,7 @@ func TestSendMessages_DegradesAnUnreadableConfirmationBody(t *testing.T) {
 
 func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
@@ -496,15 +497,16 @@ func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T)
 	require.NoError(t, err)
 
 	recorded := server.recorded()
-	require.Len(t, recorded, 2)
+	require.Len(t, recorded, 3)
 	assert.Equal(t, uint32(command.GetTopicCode), recorded[0].code())
+	assert.Equal(t, uint32(command.GetSendContextCode), recorded[1].code())
 	// 0x0D3FE0E1 modulo four partitions.
-	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
+	assert.Equal(t, uint32(1), recorded[2].partitionID(t))
 }
 
 func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
@@ -539,7 +541,7 @@ func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 
 func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, _ request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationSendMessages, nil)
 	})
 

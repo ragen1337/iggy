@@ -85,6 +85,7 @@ use iggy_binary_protocol::responses::topics::{
 use iggy_binary_protocol::responses::users::{
     GetUsersResponse, IdentityResponse, LoginRegisterResponse, UserDetailsResponse, UserResponse,
 };
+use iggy_binary_protocol::primitives::partition_history::{PartitionContext, PartitionHistory};
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireConsumer,
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
@@ -300,6 +301,11 @@ fn request_header(
 fn main() {
     let output = std::env::args().nth(1).expect("output path argument");
     let mut vectors = BTreeMap::new();
+    add(&mut vectors, "partition.context", &PartitionContext {
+        history: PartitionHistory { incarnation: 17, purge_generation: 4 },
+        owner_generation: 9,
+        metadata_op: 52,
+    });
 
     let mut lengths: Vec<usize> = (0..=300).collect();
     lengths.extend([
@@ -985,6 +991,7 @@ fn main() {
     );
     let partitions = vec![
         PartitionResponse {
+            context: Default::default(),
             id: 0,
             created_at: 1_710_000_000_000_000,
             segments_count: 2,
@@ -993,6 +1000,7 @@ fn main() {
             messages_count: 100,
         },
         PartitionResponse {
+            context: Default::default(),
             id: 1,
             created_at: 1_710_000_000_000_001,
             segments_count: 1,
@@ -1001,6 +1009,7 @@ fn main() {
             messages_count: 0,
         },
         PartitionResponse {
+            context: Default::default(),
             id: 2,
             created_at: 1_710_000_000_000_002,
             segments_count: 3,
@@ -1370,6 +1379,7 @@ fn main() {
         let second = batch_record(7, 102, 6_000, 2_000, &[frame(13, 0, 0, b"c", &[])]);
         let mut body = BytesMut::new();
         PollMessagesResponseHeader {
+            context: Default::default(),
             partition_id: 7,
             current_offset: 102,
             messages_count: 3,
@@ -1380,6 +1390,7 @@ fn main() {
         vectors.insert("response.poll_messages".to_owned(), hex(&body));
         let mut empty = BytesMut::new();
         PollMessagesResponseHeader {
+            context: Default::default(),
             partition_id: 0,
             current_offset: 0,
             messages_count: 0,
@@ -1399,6 +1410,7 @@ fn main() {
         segment_size: Some(IggyByteSize::from(1_048_576)),
         durability: Durability::Persisted,
         consumer_offset_durability: Durability::Replicated,
+        partition_resize_policy: None,
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),

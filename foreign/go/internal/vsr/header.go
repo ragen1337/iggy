@@ -21,7 +21,10 @@
 // The layout is a port of core/binary_protocol/src/consensus/header.rs.
 package vsr
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
 // HeaderSize is the length of every consensus frame header, both directions.
 // A frame is this header followed by size-HeaderSize body bytes.
@@ -48,6 +51,7 @@ const (
 	requestOffsetOperation = 176
 	requestOffsetSession   = 184
 	requestOffsetReserved  = 196
+	requestOffsetContext   = 200
 )
 
 // Reply header field offsets the client reads.
@@ -116,12 +120,9 @@ func (c ClientID) IsZero() bool {
 	return c.Lo == 0 && c.Hi == 0
 }
 
-// RequestFields are the header fields a client fills in. The rest of the 256
-// bytes stay zero. The frame and body checksums are not read on the client
-// request path. request_checksum is read, but zero means unstamped and opts out
-// of the server's payload comparison, so leaving it zero is legal; the Rust SDK
-// stamps it for deduped ops, this SDK does not yet.
+// RequestFields retain the identity and captured history of one logical request.
 type RequestFields struct {
+	Context iggcon.PartitionContext
 	// Size is the header plus body total.
 	Size uint32
 	// Client is the ephemeral identifier the server's dedup table keys on.
@@ -149,6 +150,7 @@ func EncodeRequestHeader(dst *[HeaderSize]byte, fields RequestFields) {
 	binary.LittleEndian.PutUint64(dst[requestOffsetRequest:], fields.Request)
 	dst[requestOffsetOperation] = byte(fields.Operation)
 	binary.LittleEndian.PutUint64(dst[requestOffsetSession:], fields.Session)
+	StampPartitionContext(dst, fields.Context)
 	if fields.NonReplicatedCode != 0 {
 		binary.LittleEndian.PutUint32(dst[requestOffsetReserved:], fields.NonReplicatedCode)
 	}
@@ -219,4 +221,12 @@ func ReadEviction(header *[HeaderSize]byte) Eviction {
 		ServerProtocolVersion:    binary.LittleEndian.Uint32(header[evictionOffsetServerProtocolVersion:]),
 		ServerProtocolVersionMin: binary.LittleEndian.Uint32(header[evictionOffsetServerProtocolVersionMin:]),
 	}
+}
+
+// StampPartitionContext preserves the captured history through request retries.
+func StampPartitionContext(dst *[HeaderSize]byte, captured iggcon.PartitionContext) {
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext:], captured.History.Incarnation)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+8:], captured.History.PurgeGeneration)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+16:], captured.OwnerGeneration)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+24:], captured.MetadataOp)
 }

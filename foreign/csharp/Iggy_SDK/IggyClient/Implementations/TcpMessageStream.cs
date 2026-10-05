@@ -1389,11 +1389,12 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLoginOnReconnect = true, CancellationToken token = default)
+        bool autoLoginOnReconnect = true, CancellationToken token = default, PartitionContext? capturedContext = null)
     {
+        var context = capturedContext ?? await CapturePartitionContextAsync(code, body, token);
         try
         {
-            return await SendRawAsync(code, body, token);
+            return await SendRawAsync(code, body, token, context: context);
         }
         catch (Exception e) when (IsLostConnection(e) && !IsConnecting && !_disposed)
         {
@@ -1419,7 +1420,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 throw;
             }
 
-            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token);
+            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token, context);
         }
     }
 
@@ -1432,7 +1433,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLogin, CancellationToken token)
+        bool autoLogin, CancellationToken token, PartitionContext context)
     {
         var currentTime = DateTimeOffset.UtcNow;
         await _connectionSemaphore.WaitAsync(token);
@@ -1443,7 +1444,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 && _lastConnectionTime > currentTime)
             {
                 _logger.LogInformation("Connection already established, sending payload");
-                return await SendRawAsync(code, body, token);
+                return await SendRawAsync(code, body, token, context: context);
             }
 
             SetConnectionState(ConnectionState.Disconnected);
@@ -1454,7 +1455,7 @@ public sealed partial class TcpMessageStream : IIggyClient
 
             await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
 
-            return await SendRawAsync(code, body, token);
+            return await SendRawAsync(code, body, token, context: context);
         }
         finally
         {

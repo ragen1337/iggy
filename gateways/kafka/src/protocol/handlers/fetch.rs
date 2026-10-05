@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{
-    IGGY_MESSAGE_HEADER_SIZE, IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, PolledMessages,
+    IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
+    PolledMessages,
 };
 use kafka_protocol::indexmap::IndexSet;
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
@@ -1643,6 +1644,10 @@ fn encode_records(
 /// The Java consumer retries 3, 6 and -1, and throws on 29 on purpose. It throws on other codes
 /// too, so the rest fold into these.
 const fn fetch_code(error: &BridgeError) -> i16 {
+    if matches!(error, BridgeError::Iggy(IggyError::HistoryUnavailable)) {
+        // A new read can discover the replacement history; writes must not replay into it.
+        return ERROR_NOT_LEADER_OR_FOLLOWER;
+    }
     match error.to_kafka_error_code() {
         code @ (ERROR_UNKNOWN_TOPIC_OR_PARTITION
         | ERROR_NOT_LEADER_OR_FOLLOWER
@@ -1743,7 +1748,7 @@ fn partition_response(partition: i32, error_code: i16) -> PartitionData {
 mod tests {
     use std::collections::BTreeMap;
 
-    use iggy::prelude::{HeaderKey, HeaderValue, IggyError};
+    use iggy::prelude::{HeaderKey, HeaderValue};
     use kafka_protocol::indexmap::IndexMap;
     use kafka_protocol::messages::TopicName;
     use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
@@ -1904,6 +1909,7 @@ mod tests {
             current_offset,
             count: u32::try_from(messages.len()).unwrap(),
             messages,
+            context: iggy::prelude::PartitionContext::default(),
         }
     }
 
@@ -2467,6 +2473,10 @@ mod tests {
             (BridgeError::Timeout, ERROR_NOT_LEADER_OR_FOLLOWER),
             (
                 BridgeError::Iggy(IggyError::TransientNotCommitted),
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+            ),
+            (
+                BridgeError::Iggy(IggyError::HistoryUnavailable),
                 ERROR_NOT_LEADER_OR_FOLLOWER,
             ),
             (

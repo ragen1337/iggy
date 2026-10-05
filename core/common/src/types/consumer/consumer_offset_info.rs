@@ -31,3 +31,14 @@ pub struct ConsumerOffsetInfo {
     /// The stored offset by the consumer in the partition.
     pub stored_offset: u64,
 }
+
+/// A checkpoint retains the history and owner that delivered its messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerPosition {
+    /// Partition from which the message was consumed.
+    pub partition_id: u32,
+    /// Inclusive message offset to commit.
+    pub offset: u64,
+    /// History and owner captured by the poll; retain both for a delayed commit.
+    pub context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
+}

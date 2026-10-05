@@ -24,13 +24,38 @@ import (
 	"github.com/google/uuid"
 )
 
+const PartitionContextSize = 32
+
+type PartitionHistory struct {
+	Incarnation     uint64 `json:"incarnation"`
+	PurgeGeneration uint64 `json:"purge_generation"`
+}
+
+type PartitionContext struct {
+	History         PartitionHistory `json:"history"`
+	OwnerGeneration uint64           `json:"owner_generation"`
+	MetadataOp      uint64           `json:"metadata_op"`
+}
+
+func (c *PartitionContext) UnmarshalBinary(data []byte) error {
+	if len(data) != PartitionContextSize {
+		return errors.New("invalid partition context size")
+	}
+	c.History.Incarnation = binary.LittleEndian.Uint64(data)
+	c.History.PurgeGeneration = binary.LittleEndian.Uint64(data[8:])
+	c.OwnerGeneration = binary.LittleEndian.Uint64(data[16:])
+	c.MetadataOp = binary.LittleEndian.Uint64(data[24:])
+	return nil
+}
+
 type PartitionContract struct {
-	Id            uint32 `json:"id"`
-	MessagesCount uint64 `json:"messagesCount"`
-	CreatedAt     uint64 `json:"createdAt"`
-	SegmentsCount uint32 `json:"segmentsCount"`
-	CurrentOffset uint64 `json:"currentOffset"`
-	SizeBytes     uint64 `json:"sizeBytes"`
+	Context       PartitionContext `json:"context"`
+	Id            uint32           `json:"id"`
+	MessagesCount uint64           `json:"messagesCount"`
+	CreatedAt     uint64           `json:"createdAt"`
+	SegmentsCount uint32           `json:"segmentsCount"`
+	CurrentOffset uint64           `json:"currentOffset"`
+	SizeBytes     uint64           `json:"sizeBytes"`
 }
 
 type PartitioningKind int

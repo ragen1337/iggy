@@ -415,6 +415,11 @@ func (c *IggyTcpClient) write(payload []byte) (int, error) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	var err error
+	ctx, err = c.capturePartitionContext(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 
@@ -800,6 +805,9 @@ func (c *IggyTcpClient) attempt(
 		if err := vsr.StampRequestHeader(c.session, code, frame); err != nil {
 			return nil, false, generation, &localPreconditionError{err}
 		}
+		if captured, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
+			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), captured)
+		}
 		stamped = true
 	}
 
@@ -911,6 +919,7 @@ func (c *IggyTcpClient) exchangeLocked(
 			uncertain = true
 		}
 		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) ||
+			errors.Is(err, ierror.ErrHistoryUnavailable) ||
 			errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) ||
 			errors.Is(err, ierror.ErrUnauthorized)) {
 			c.handleReplyFailureLocked(err)

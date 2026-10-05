@@ -60,6 +60,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
         payload.writeBytes(BytesSerializer.toBytes(streamId));
         payload.writeBytes(BytesSerializer.toBytes(topicId));
         payload.writeBytes(BytesSerializer.toBytes(partitionId));
+        var contextPayload = payload.copy();
         payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
         payload.writeByte(ACK_QUORUM);
 
@@ -72,7 +73,12 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 offset);
 
         return connection()
-                .send(CommandCode.ConsumerOffset.STORE.getValue(), payload)
+                .sendWithPartitionContext(
+                        CommandCode.ConsumerOffset.STORE.getValue(),
+                        payload,
+                        CommandCode.ConsumerOffset.GET_ROUTING.getValue(),
+                        contextPayload,
+                        AsyncTcpConnection.CONSUMER_SESSION_SIZE)
                 .thenAccept(response -> {
                     response.release();
                 });

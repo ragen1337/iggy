@@ -24,4 +24,6 @@ pub struct StoreConsumerOffset {
     pub consumer: Consumer,
     pub partition_id: Option<u32>,
     pub offset: u64,
+    #[serde(default)]
+    pub context: Option<iggy_binary_protocol::primitives::partition_history::PartitionContext>,
 }

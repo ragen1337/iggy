@@ -37,6 +37,7 @@ import org.apache.iggy.message.PartitioningKind;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.TopicDetails;
@@ -192,7 +193,7 @@ public class MessagesTcpClient implements MessagesClient {
 
     private CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, boolean autoCommit) {
         if (!autoCommit || pollRouter == null) {
-            return connection().send(CommandCode.Messages.POLL.getValue(), payload);
+            return sendPlainPoll(payload);
         }
         PollCancellation cancellation = new PollCancellation();
         CompletableFuture<ByteBuf> result = clustered
@@ -203,9 +204,7 @@ public class MessagesTcpClient implements MessagesClient {
                         return CompletableFuture.<ByteBuf>failedFuture(
                                 error != null ? error : new CancellationException());
                     }
-                    CompletableFuture<ByteBuf> sent = isClustered
-                            ? pollRouter.poll(payload)
-                            : connection().send(CommandCode.Messages.POLL.getValue(), payload);
+                    CompletableFuture<ByteBuf> sent = isClustered ? pollRouter.poll(payload) : sendPlainPoll(payload);
                     cancellation.track(sent);
                     return sent;
                 })
@@ -216,6 +215,16 @@ public class MessagesTcpClient implements MessagesClient {
             }
         });
         return result;
+    }
+
+    private CompletableFuture<ByteBuf> sendPlainPoll(ByteBuf payload) {
+        return connection()
+                .sendWithPartitionContext(
+                        CommandCode.Messages.POLL.getValue(),
+                        payload,
+                        CommandCode.Messages.GET_POLL_ROUTING.getValue(),
+                        payload.retainedDuplicate(),
+                        AsyncTcpConnection.CONSUMER_SESSION_SIZE);
     }
 
     @Override
@@ -257,7 +266,17 @@ public class MessagesTcpClient implements MessagesClient {
             writeAndRelease(payload, toBytes(partitioning));
             payload.writeIntLE(messages.size());
             encodeMessagesBatchInto(payload, messages);
-            sent = connection().send(CommandCode.Messages.SEND.getValue(), payload);
+            var contextPayload = Unpooled.buffer();
+            writeAndRelease(contextPayload, toBytes(streamId));
+            writeAndRelease(contextPayload, toBytes(topicId));
+            contextPayload.writeBytes(partitioning.value());
+            sent = connection()
+                    .sendWithPartitionContext(
+                            CommandCode.Messages.SEND.getValue(),
+                            payload,
+                            CommandCode.Messages.GET_SEND_CONTEXT.getValue(),
+                            contextPayload,
+                            0);
         } catch (RuntimeException | Error error) {
             payload.release();
             throw error;
@@ -397,7 +416,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     private static PolledMessages emptyPolledMessages() {
-        return new PolledMessages(0L, BigInteger.ZERO, 0L, List.of());
+        return new PolledMessages(0L, BigInteger.ZERO, 0L, List.of(), PartitionContext.EMPTY);
     }
 
     private CompletableFuture<Partitioning> resolvePartitioning(

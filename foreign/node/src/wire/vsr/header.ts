@@ -43,7 +43,11 @@ export const REQUEST_OFFSET = {
   request: 168,
   operation: 176,
   session: 184,
-  reserved: 196
+  reserved: 196,
+  partitionIncarnation: 200,
+  purgeGeneration: 208,
+  ownerGeneration: 216,
+  minimumMetadataOp: 224
 } as const;
 
 /** `ReplyHeader` field offsets the client reads. */
@@ -52,7 +56,10 @@ export const REPLY_OFFSET = {
   command: 60,
   commit: 184,
   operation: 208,
-  status: 216
+  status: 216,
+  partitionIncarnation: 224,
+  purgeGeneration: 232,
+  ownerGeneration: 240
 } as const;
 
 /** `EvictionHeader` field offsets the client reads. */
@@ -94,8 +101,32 @@ export const EvictionReason = {
   MalformedLogin: 15
 } as const;
 
+export const PARTITION_CONTEXT_SIZE = 32;
+
+export type PartitionContext = {
+  readonly history: { readonly incarnation: bigint, readonly purgeGeneration: bigint },
+  readonly ownerGeneration: bigint,
+  readonly metadataOp: bigint
+};
+
+export const EMPTY_PARTITION_CONTEXT: PartitionContext = Object.freeze({
+  history: Object.freeze({ incarnation: 0n, purgeGeneration: 0n }),
+  ownerGeneration: 0n,
+  metadataOp: 0n
+});
+
+export const deserializePartitionContext = (data: Buffer, offset = 0): PartitionContext => ({
+  history: {
+    incarnation: data.readBigUInt64LE(offset),
+    purgeGeneration: data.readBigUInt64LE(offset + 8)
+  },
+  ownerGeneration: data.readBigUInt64LE(offset + 16),
+  metadataOp: data.readBigUInt64LE(offset + 24)
+});
+
 /** Fields the client writes into a request header. */
 export type RequestHeaderFields = {
+  context?: PartitionContext,
   /** Header + body total, bytes. */
   size: number,
   /** Ephemeral client identifier (u128). */
@@ -112,13 +143,7 @@ export type RequestHeaderFields = {
 
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 
-/**
- * Encodes a 256-byte request header. Only the six fields the server reads
- * are written. The checksums stay zero: the frame and body checksums are not
- * read on the client request path, and `request_checksum` treats zero as
- * unstamped, which opts out of the server's payload comparison. Stamping it is
- * optional -- the Rust SDK does for deduped ops, this SDK does not yet.
- */
+/** Encodes one request identity and its captured partition context. */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(fields.size, REQUEST_OFFSET.size);
@@ -129,6 +154,11 @@ export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   header.writeBigUInt64LE(fields.request, REQUEST_OFFSET.request);
   header.writeUInt8(fields.operation, REQUEST_OFFSET.operation);
   header.writeBigUInt64LE(fields.session, REQUEST_OFFSET.session);
+  const context = fields.context ?? EMPTY_PARTITION_CONTEXT;
+  header.writeBigUInt64LE(context.history.incarnation, REQUEST_OFFSET.partitionIncarnation);
+  header.writeBigUInt64LE(context.history.purgeGeneration, REQUEST_OFFSET.purgeGeneration);
+  header.writeBigUInt64LE(context.ownerGeneration, REQUEST_OFFSET.ownerGeneration);
+  header.writeBigUInt64LE(context.metadataOp, REQUEST_OFFSET.minimumMetadataOp);
   if (fields.nonReplicatedCode !== undefined)
     header.writeUInt32LE(fields.nonReplicatedCode, REQUEST_OFFSET.reserved);
   return header;

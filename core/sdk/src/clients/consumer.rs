@@ -20,6 +20,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+use iggy_common::ConsumerPosition;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
@@ -110,8 +112,8 @@ pub struct IggyConsumerState {
     is_consumer_group: bool,
     allow_replay: bool,
     current_partition_id: Arc<AtomicU32>,
-    last_consumed_offsets: Arc<DashMap<u32, AtomicU64>>,
-    last_stored_offsets: Arc<DashMap<u32, AtomicU64>>,
+    last_consumed_offsets: Arc<DashMap<u32, ConsumerPosition>>,
+    last_stored_offsets: Arc<DashMap<u32, ConsumerPosition>>,
 }
 
 impl Debug for IggyConsumerState {
@@ -154,22 +156,20 @@ impl IggyConsumerState {
         self.current_partition_id.load(ORDERING)
     }
 
-    /// Retrieves the last consumed offset for the specified partition ID, or `None` while
-    /// the partition is still untracked. Polling seeds an entry the first time it sees a
-    /// partition, so `Some(0)` also covers "seen, nothing consumed yet".
+    /// Returns the last offset handed over for this partition, or `None` until
+    /// a message from the partition has been consumed.
     /// To get the current partition ID use `partition_id()`
     pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_consumed_offsets.get(&partition_id)?;
-        Some(offset.load(ORDERING))
+        Some(offset.offset)
     }
 
-    /// Retrieves the last stored offset (on the server) for the specified partition ID, or
-    /// `None` while the partition is still untracked. Storing seeds an entry the first time
-    /// it sees a partition, so `Some(0)` also covers "seen, nothing stored yet".
+    /// Returns the last offset successfully stored for this partition, or
+    /// `None` until this consumer has stored one.
     /// To get the current partition ID use `partition_id()`
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_stored_offsets.get(&partition_id)?;
-        Some(offset.load(ORDERING))
+        Some(offset.offset)
     }
 
     /// Stores the consumer offset on the server either for the current partition or the provided partition ID.
@@ -179,8 +179,25 @@ impl IggyConsumerState {
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
         let partition_id = partition_id.unwrap_or_else(|| self.partition_id());
-        self.store_consumer_offset(partition_id, offset, self.allow_replay)
-            .await
+        let position = self
+            .last_consumed_offsets
+            .get(&partition_id)
+            .map(|last| ConsumerPosition { offset, ..*last });
+        if let Some(position) = position {
+            self.store_position(position).await
+        } else {
+            self.client
+                .read()
+                .await
+                .store_consumer_offset(
+                    &self.consumer,
+                    &self.stream_id,
+                    &self.topic_id,
+                    Some(partition_id),
+                    offset,
+                )
+                .await
+        }
     }
 
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
@@ -201,62 +218,41 @@ impl IggyConsumerState {
             .await
     }
 
-    async fn store_consumer_offset(
+    /// Store the exact position delivered to the application, even after another poll or rebalance.
+    pub async fn store_position(&self, position: ConsumerPosition) -> Result<(), IggyError> {
+        self.store_consumer_position(position, self.allow_replay)
+            .await
+    }
+
+    async fn store_consumer_position(
         &self,
-        partition_id: u32,
-        offset: u64,
+        position: ConsumerPosition,
         allow_replay: bool,
     ) -> Result<(), IggyError> {
-        let consumer = &self.consumer;
-        let stream_id = &self.stream_id;
-        let topic_id = &self.topic_id;
-        trace!(
-            "Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}..."
-        );
-        let stored_offset;
-        if let Some(offset_entry) = self.last_stored_offsets.get(&partition_id) {
-            stored_offset = offset_entry.load(ORDERING);
-        } else {
-            stored_offset = 0;
-            self.last_stored_offsets
-                .insert(partition_id, AtomicU64::new(0));
-        }
-
-        if !allow_replay && (offset <= stored_offset && offset >= 1) {
-            trace!(
-                "Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset."
-            );
+        if !allow_replay
+            && self
+                .last_stored_offsets
+                .get(&position.partition_id)
+                .is_some_and(|stored| {
+                    stored.context == position.context && position.offset <= stored.offset
+                })
+        {
             return Ok(());
         }
-
-        let client = self.client.read().await;
-        if let Err(error) = client
-            .store_consumer_offset(consumer, stream_id, topic_id, Some(partition_id), offset)
+        self.client
+            .read()
             .await
-        {
-            error!(
-                "Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}"
-            );
-            return Err(error);
-        }
-        trace!(
-            "Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}."
-        );
-        if let Some(last_offset_entry) = self.last_stored_offsets.get(&partition_id) {
-            last_offset_entry.store(offset, ORDERING);
-        } else {
-            self.last_stored_offsets
-                .insert(partition_id, AtomicU64::new(offset));
-        }
+            .store_consumer_position(&self.consumer, &self.stream_id, &self.topic_id, position)
+            .await?;
+        self.last_stored_offsets
+            .insert(position.partition_id, position);
         Ok(())
     }
 
-    /// Snapshots the last consumed offset of every tracked partition. Collecting up front
-    /// releases the map guards, which must not be held across the store round trip.
-    fn last_consumed_offsets(&self) -> Vec<(u32, u64)> {
+    fn last_consumed_positions(&self) -> Vec<ConsumerPosition> {
         self.last_consumed_offsets
             .iter()
-            .map(|entry| (*entry.key(), entry.load(ORDERING)))
+            .map(|entry| *entry.value())
             .collect()
     }
 }
@@ -649,7 +645,7 @@ pub struct IggyConsumer {
     polling_strategy: PollingStrategy,
     /// The next offset to ask each partition for. Empty under [`PollingStrategy::next()`], which
     /// leaves the continuation to the offset stored on the server.
-    next_offsets: Arc<DashMap<u32, u64>>,
+    next_offsets: Arc<DashMap<u32, ConsumerPosition>>,
     poll_interval_micros: u64,
     batch_length: u32,
     auto_commit: AutoCommit,
@@ -660,10 +656,11 @@ pub struct IggyConsumer {
     current_offsets: Arc<DashMap<u32, AtomicU64>>,
     poll_future: Option<PollMessagesFuture>,
     buffered_messages: VecDeque<IggyMessage>,
+    buffered_context: PartitionContext,
     encryptor: Option<Arc<EncryptorKind>>,
     /// The latest offset each message trigger asked to commit, per partition. The store task
     /// drains it, so a burst of triggers costs one round trip per partition instead of one each.
-    pending_commits: Arc<DashMap<u32, u64>>,
+    pending_commits: Arc<DashMap<u32, ConsumerPosition>>,
     store_offset_notify: Arc<Notify>,
     store_offset_task: Option<JoinHandle<()>>,
     background_commit_task: Option<JoinHandle<()>>,
@@ -750,6 +747,7 @@ impl IggyConsumer {
             auto_join_consumer_group,
             create_consumer_group_if_not_exists,
             buffered_messages: VecDeque::new(),
+            buffered_context: PartitionContext::default(),
             encryptor,
             pending_commits: Arc::new(DashMap::new()),
             store_offset_notify: Arc::new(Notify::new()),
@@ -828,11 +826,11 @@ impl IggyConsumer {
     /// consumer group can already point at another partition. Prefer passing
     /// [`ReceivedMessage::partition_id`].
     ///
-    /// An offset that is not ahead of the last one this consumer stored for that partition is
+    /// An offset that is not ahead of the last one stored in the same captured context is
     /// skipped and `Ok(())` is returned without a request, unless the consumer was built with
-    /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay). Offset `0` is always
-    /// sent, yet [`PollingStrategy::next()`] then resumes at offset `1`, so it does not rewind to
-    /// the start. To start over from the first message, delete the stored offset with
+    /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay).
+    /// This method uses the latest consumed context. Use [`Self::store_position`]
+    /// for a message held across a purge or ownership change. To start over from the first message, delete the stored offset with
     /// [`delete_offset()`](Self::delete_offset) after [`shutdown()`](Self::shutdown) and build a new
     /// consumer. A new consumer built with [`PollingStrategy::offset()`] re-reads from any point.
     ///
@@ -849,9 +847,18 @@ impl IggyConsumer {
         self.state.store_offset(offset, partition_id).await
     }
 
+    /// Commit a message's captured history and owner using [`ReceivedMessage::position`].
+    /// A position from a purged history or a previous owner is refused without
+    /// updating replacement progress.
+    ///
+    /// # Errors
+    /// Returns the server's storage, permission, history or ownership error.
+    pub async fn store_position(&self, position: ConsumerPosition) -> Result<(), IggyError> {
+        self.state.store_position(position).await
+    }
+
     /// Returns the offset of the last message this consumer handed over for the given partition,
-    /// or `None` while it has not polled that partition yet. The first poll of a partition seeds
-    /// the entry with `0`, so `Some(0)` also covers "polled, nothing handed over yet".
+    /// or `None` until a message from that partition has been handed over.
     ///
     /// This is the local reading position, which can be ahead of what has been stored on the
     /// server.
@@ -876,8 +883,7 @@ impl IggyConsumer {
     }
 
     /// Returns the offset this consumer last stored on the server for the given partition, or
-    /// `None` while it has neither polled nor stored for that partition. The first poll or store
-    /// seeds the entry, so `Some(0)` also covers "seen, nothing stored yet".
+    /// `None` until this consumer has successfully stored an offset for that partition.
     ///
     /// The value is this consumer's own record of what it committed, kept in memory rather than
     /// read back from the server.
@@ -933,7 +939,7 @@ impl IggyConsumer {
     ///   stays idle under [`AutoCommit::Disabled`].
     ///
     /// Both skip an offset that is not ahead of this consumer's own record of what it stored
-    /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)). Only offset `0` is always sent.
+    /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)) in the same captured context.
     /// Under auto-commit-on-poll (the default) that record trails the server by one batch, so every
     /// tick re-sends the reading position and the server, which takes an explicit store as is,
     /// moves its offset back to it until the next poll.
@@ -1083,10 +1089,8 @@ impl IggyConsumer {
                     trace!("Shutdown signal received, stopping background offset storage");
                     break;
                 }
-                for (partition_id, consumed_offset) in state.last_consumed_offsets() {
-                    _ = state
-                        .store_consumer_offset(partition_id, consumed_offset, false)
-                        .await;
+                for position in state.last_consumed_positions() {
+                    _ = state.store_consumer_position(position, false).await;
                 }
             }
         })
@@ -1107,12 +1111,10 @@ impl IggyConsumer {
                 let partitions: Vec<u32> =
                     pending_commits.iter().map(|entry| *entry.key()).collect();
                 for partition_id in partitions {
-                    let Some((_, offset)) = pending_commits.remove(&partition_id) else {
+                    let Some((_, position)) = pending_commits.remove(&partition_id) else {
                         continue;
                     };
-                    _ = state
-                        .store_consumer_offset(partition_id, offset, false)
-                        .await;
+                    _ = state.store_consumer_position(position, false).await;
                 }
                 if shutdown.load(ORDERING) && pending_commits.is_empty() {
                     break;
@@ -1123,15 +1125,16 @@ impl IggyConsumer {
 
     /// Queues a commit for the store task. A later offset for the same partition replaces a
     /// queued one that has not been sent yet.
-    pub(crate) fn send_store_offset(&self, partition_id: u32, offset: u64) {
+    pub(crate) fn send_store_offset(&self, position: ConsumerPosition) {
         if !self.initialized || self.shutdown.load(ORDERING) {
             error!(
-                "Offset: {offset} for partition ID: {partition_id} was not queued for storing, consumer: {} is not initialized or has been shut down.",
-                self.consumer_name
+                ?position,
+                consumer = self.consumer_name,
+                "Offset was not queued because the consumer is not running"
             );
             return;
         }
-        self.pending_commits.insert(partition_id, offset);
+        self.pending_commits.insert(position.partition_id, position);
         self.store_offset_notify.notify_one();
     }
 
@@ -1277,7 +1280,9 @@ impl IggyConsumer {
             let strategy_for = |partition: u32| {
                 next_offsets
                     .get(&partition)
-                    .map_or(polling_strategy, |offset| PollingStrategy::offset(*offset))
+                    .map_or(polling_strategy, |position| {
+                        PollingStrategy::offset(position.offset).with_context(position.context)
+                    })
             };
             let polled_messages = client
                 .read()
@@ -1296,6 +1301,7 @@ impl IggyConsumer {
             if let Ok(polled) = &polled_messages
                 && polled.partition_id == NO_ASSIGNED_PARTITION
             {
+                next_offsets.clear();
                 trace!(
                     "No partition assigned to consumer: {consumer_name}, waiting {retry_interval}..."
                 );
@@ -1308,43 +1314,29 @@ impl IggyConsumer {
                 }
 
                 let partition_id = polled_messages.partition_id;
-                let consumed_offset;
-                let has_consumed_offset;
-                if let Some(offset_entry) = last_consumed_offset.get(&partition_id) {
-                    has_consumed_offset = true;
-                    consumed_offset = offset_entry.load(ORDERING);
-                } else {
-                    consumed_offset = 0;
-                    has_consumed_offset = false;
-                    last_consumed_offset.insert(partition_id, AtomicU64::new(0));
-                }
-
-                if !allow_replay && has_consumed_offset {
+                let consumed = last_consumed_offset
+                    .get(&partition_id)
+                    .filter(|position| {
+                        position.context.history == polled_messages.context.history
+                            && position.context.owner_generation
+                                == polled_messages.context.owner_generation
+                    })
+                    .map(|position| position.offset);
+                if !allow_replay && let Some(consumed) = consumed {
                     polled_messages
                         .messages
-                        .retain(|message| message.header.offset > consumed_offset);
+                        .retain(|message| message.header.offset > consumed);
                     polled_messages.count = polled_messages.messages.len() as u32;
-                    if polled_messages.messages.is_empty() {
-                        return Ok(polled_messages);
-                    }
                 }
-
-                let stored_offset;
-                if let Some(stored_offset_entry) = last_stored_offset.get(&partition_id) {
-                    if auto_commit_after_polling {
-                        stored_offset_entry.store(consumed_offset, ORDERING);
-                        stored_offset = consumed_offset;
-                    } else {
-                        stored_offset = stored_offset_entry.load(ORDERING);
-                    }
-                } else {
-                    if auto_commit_after_polling {
-                        stored_offset = consumed_offset;
-                    } else {
-                        stored_offset = 0;
-                    }
-                    last_stored_offset.insert(partition_id, AtomicU64::new(stored_offset));
-                }
+                let consumed_offset = consumed.unwrap_or(0);
+                let stored_offset = last_stored_offset
+                    .get(&partition_id)
+                    .filter(|position| {
+                        position.context.history == polled_messages.context.history
+                            && position.context.owner_generation
+                                == polled_messages.context.owner_generation
+                    })
+                    .map_or(0, |position| position.offset);
 
                 trace!(
                     "Last consumed offset: {consumed_offset}, current offset: {}, stored offset: {stored_offset}, in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}",
@@ -1354,6 +1346,12 @@ impl IggyConsumer {
             }
 
             let error = polled_messages.unwrap_err();
+            if matches!(
+                error,
+                IggyError::HistoryUnavailable | IggyError::ConsumerGroupPartitionNotOwned(..)
+            ) {
+                next_offsets.clear();
+            }
             error!("Failed to poll messages: {error}");
 
             if is_consumer_group
@@ -1494,10 +1492,12 @@ impl IggyConsumer {
 
 /// A single message handed over by an [`IggyConsumer`].
 pub struct ReceivedMessage {
+    /// History and owner captured by the poll. Retain it for delayed manual commits.
+    pub context: PartitionContext,
     /// The message itself, with its payload already decrypted when the client uses an encryptor.
     ///
-    /// Its own offset is `message.header.offset`, which is the value to pass to
-    /// [`IggyConsumer::store_offset`] when committing by hand.
+    /// Commit [`Self::position`] with [`IggyConsumer::store_position`] to retain
+    /// the history and owner even if another poll observes a newer context.
     pub message: IggyMessage,
     /// The offset of the newest message in the partition at the time it was polled.
     ///
@@ -1513,10 +1513,25 @@ pub struct ReceivedMessage {
 }
 
 impl ReceivedMessage {
+    #[must_use]
+    pub const fn position(&self) -> ConsumerPosition {
+        ConsumerPosition {
+            partition_id: self.partition_id,
+            offset: self.message.header.offset,
+            context: self.context,
+        }
+    }
+
     /// Creates a received message from a message, the partition head at poll time and the
     /// partition it was read from.
-    pub fn new(message: IggyMessage, current_offset: u64, partition_id: u32) -> Self {
+    pub fn new(
+        message: IggyMessage,
+        current_offset: u64,
+        partition_id: u32,
+        context: PartitionContext,
+    ) -> Self {
         Self {
+            context,
             message,
             current_offset,
             partition_id,
@@ -1538,24 +1553,24 @@ impl Stream for IggyConsumer {
         let partition_id = self.state.partition_id();
         if let Some(message) = self.buffered_messages.pop_front() {
             {
-                // Since a consumer can be standalone or a member of a consumer group, in which case
-                // it can be reassigned to another partition, either update the offset of a partition
-                // the consumer already worked with or add a new record, if it got reassigned.
-                if let Some(last_consumed_offset_entry) =
-                    self.state.last_consumed_offsets.get(&partition_id)
-                {
-                    last_consumed_offset_entry.store(message.header.offset, ORDERING);
-                } else {
-                    self.state
-                        .last_consumed_offsets
-                        .insert(partition_id, AtomicU64::new(message.header.offset));
-                }
+                self.state.last_consumed_offsets.insert(
+                    partition_id,
+                    ConsumerPosition {
+                        partition_id,
+                        offset: message.header.offset,
+                        context: self.buffered_context,
+                    },
+                );
 
                 if (self.store_after_every_nth_message > 0
                     && message.header.offset % self.store_after_every_nth_message == 0)
                     || self.store_offset_after_each_message
                 {
-                    self.send_store_offset(partition_id, message.header.offset);
+                    self.send_store_offset(ConsumerPosition {
+                        partition_id,
+                        offset: message.header.offset,
+                        context: self.buffered_context,
+                    });
                 }
             }
 
@@ -1564,12 +1579,22 @@ impl Stream for IggyConsumer {
             // poll continues after the last message handed over from that partition.
             if self.buffered_messages.is_empty() {
                 if self.polling_strategy.kind != PollingKind::Next {
-                    self.next_offsets
-                        .insert(partition_id, message.header.offset + 1);
+                    self.next_offsets.insert(
+                        partition_id,
+                        ConsumerPosition {
+                            partition_id,
+                            offset: message.header.offset + 1,
+                            context: self.buffered_context,
+                        },
+                    );
                 }
 
                 if self.store_offset_after_all_messages {
-                    self.send_store_offset(partition_id, message.header.offset);
+                    self.send_store_offset(ConsumerPosition {
+                        partition_id,
+                        offset: message.header.offset,
+                        context: self.buffered_context,
+                    });
                 }
             }
 
@@ -1586,6 +1611,7 @@ impl Stream for IggyConsumer {
                 message,
                 current_offset,
                 partition_id,
+                self.buffered_context,
             ))));
         }
 
@@ -1601,6 +1627,7 @@ impl Stream for IggyConsumer {
                     let PolledMessages {
                         partition_id,
                         current_offset,
+                        context,
                         messages,
                         ..
                     } = polled_messages;
@@ -1657,21 +1684,27 @@ impl Stream for IggyConsumer {
 
                     // A poll is only sent once the buffer has run empty, so nothing is overwritten.
                     self.buffered_messages = messages;
+                    self.buffered_context = context;
 
                     if self.polling_strategy.kind != PollingKind::Next {
-                        self.next_offsets
-                            .insert(partition_id, first.header.offset + 1);
+                        self.next_offsets.insert(
+                            partition_id,
+                            ConsumerPosition {
+                                partition_id,
+                                offset: first.header.offset + 1,
+                                context,
+                            },
+                        );
                     }
 
-                    if let Some(last_consumed_offset_entry) =
-                        self.state.last_consumed_offsets.get(&partition_id)
-                    {
-                        last_consumed_offset_entry.store(first.header.offset, ORDERING);
-                    } else {
-                        self.state
-                            .last_consumed_offsets
-                            .insert(partition_id, AtomicU64::new(first.header.offset));
-                    }
+                    self.state.last_consumed_offsets.insert(
+                        partition_id,
+                        ConsumerPosition {
+                            partition_id,
+                            offset: first.header.offset,
+                            context,
+                        },
+                    );
 
                     if (self.store_after_every_nth_message > 0
                         && first.header.offset % self.store_after_every_nth_message == 0)
@@ -1679,7 +1712,11 @@ impl Stream for IggyConsumer {
                         || (self.store_offset_after_all_messages
                             && self.buffered_messages.is_empty())
                     {
-                        self.send_store_offset(partition_id, first.header.offset);
+                        self.send_store_offset(ConsumerPosition {
+                            partition_id,
+                            offset: first.header.offset,
+                            context,
+                        });
                     }
 
                     // Drop future since it is [invalid after being ready](https://doc.rust-lang.org/std/future/trait.Future.html#panics)
@@ -1688,6 +1725,7 @@ impl Stream for IggyConsumer {
                         first,
                         current_offset,
                         partition_id,
+                        context,
                     ))));
                 }
                 Poll::Ready(Err(err)) => {
@@ -1769,17 +1807,13 @@ impl IggyConsumer {
         }
 
         if self.auto_commit != AutoCommit::Disabled {
-            for (partition_id, consumed_offset) in self.state.last_consumed_offsets() {
-                let stored_offset = self.state.get_last_stored_offset(partition_id).unwrap_or(0);
-                if consumed_offset > stored_offset {
-                    trace!(
-                        "Flushing final offset: {consumed_offset} for partition: {partition_id}, stream: {}, topic: {}",
-                        self.stream_id, self.topic_id
-                    );
-                    let _ = self
-                        .state
-                        .store_consumer_offset(partition_id, consumed_offset, self.allow_replay)
-                        .await;
+            for position in self.state.last_consumed_positions() {
+                if let Err(error) = self
+                    .state
+                    .store_consumer_position(position, self.allow_replay)
+                    .await
+                {
+                    warn!(?position, %error, "Final consumer checkpoint was not acknowledged");
                 }
             }
         }
@@ -1964,7 +1998,7 @@ mod tests {
         consumer
             .next_offsets
             .get(&partition_id)
-            .map(|offset| *offset)
+            .map(|position| position.offset)
     }
 
     #[test]
@@ -2068,14 +2102,26 @@ mod tests {
         let mut consumer = builder().build();
         consumer.initialized = true;
 
-        consumer.send_store_offset(1, 5);
-        consumer.send_store_offset(1, 7);
-        consumer.send_store_offset(2, 3);
+        consumer.send_store_offset(ConsumerPosition {
+            partition_id: 1,
+            offset: 5,
+            context: PartitionContext::default(),
+        });
+        consumer.send_store_offset(ConsumerPosition {
+            partition_id: 1,
+            offset: 7,
+            context: PartitionContext::default(),
+        });
+        consumer.send_store_offset(ConsumerPosition {
+            partition_id: 2,
+            offset: 3,
+            context: PartitionContext::default(),
+        });
 
         let mut queued: Vec<(u32, u64)> = consumer
             .pending_commits
             .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
+            .map(|entry| (*entry.key(), entry.value().offset))
             .collect();
         queued.sort_unstable();
         assert_eq!(queued, vec![(1, 7), (2, 3)]);

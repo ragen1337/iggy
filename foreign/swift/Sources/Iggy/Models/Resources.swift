@@ -205,8 +205,48 @@ public struct TopicDetails: Sendable, Hashable {
     }
 }
 
+/// Immutable authority captured before a partition operation is sent.
+public struct PartitionContext: Sendable, Hashable {
+    public let history: PartitionHistory
+    public let ownerGeneration: UInt64
+    public let metadataOp: UInt64
+
+    public init(history: PartitionHistory, ownerGeneration: UInt64, metadataOp: UInt64) {
+        self.history = history
+        self.ownerGeneration = ownerGeneration
+        self.metadataOp = metadataOp
+    }
+
+    public static let empty = PartitionContext(history: .init(incarnation: 0, purgeGeneration: 0), ownerGeneration: 0, metadataOp: 0)
+
+    func encode(into writer: inout ByteWriter) {
+        writer.write(history.incarnation)
+        writer.write(history.purgeGeneration)
+        writer.write(ownerGeneration)
+        writer.write(metadataOp)
+    }
+
+    static func decode(from reader: inout ByteReader) throws -> PartitionContext {
+        try PartitionContext(
+            history: .init(incarnation: reader.readUInt64(), purgeGeneration: reader.readUInt64()),
+            ownerGeneration: reader.readUInt64(), metadataOp: reader.readUInt64())
+    }
+}
+
+/// History to which offsets and retry results belong.
+public struct PartitionHistory: Sendable, Hashable {
+    public let incarnation: UInt64
+    public let purgeGeneration: UInt64
+
+    public init(incarnation: UInt64, purgeGeneration: UInt64) {
+        self.incarnation = incarnation
+        self.purgeGeneration = purgeGeneration
+    }
+}
+
 /// One partition of a topic.
 public struct Partition: Sendable, Hashable {
+    public var context: PartitionContext
     public var id: UInt32
     public var createdAt: IggyTimestamp
     public var segmentsCount: UInt32
@@ -214,7 +254,11 @@ public struct Partition: Sendable, Hashable {
     public var sizeBytes: UInt64
     public var messagesCount: UInt64
 
-    public init(id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64) {
+    public init(
+        id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64,
+        context: PartitionContext = .empty
+    ) {
+        self.context = context
         self.id = id
         self.createdAt = createdAt
         self.segmentsCount = segmentsCount

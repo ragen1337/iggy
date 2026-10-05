@@ -32,6 +32,7 @@ import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 
@@ -191,7 +192,7 @@ final class PollRouter {
 
     private Route decodeRoute(AsyncTcpConnection parent, Poll poll, ByteBuf response) {
         try {
-            if (response.readableBytes() < ATTACHMENT_BYTES) {
+            if (response.readableBytes() < ATTACHMENT_BYTES + PartitionContext.ENCODED_SIZE) {
                 throw new IggyClientException("Truncated primary poll session attachment");
             }
             Attachment attachment = new Attachment(
@@ -201,6 +202,7 @@ final class PollRouter {
             if (generation != parent.sessionGeneration()) {
                 throw new IggyClientException("Parent session changed while decoding a poll route");
             }
+            var context = BytesDeserializer.readPartitionContext(response);
             var node = BytesDeserializer.readClusterNode(response);
             if (response.isReadable() || node.endpoints().tcp() == 0) {
                 throw new IggyClientException("Invalid TCP primary poll routing response");
@@ -212,7 +214,8 @@ final class PollRouter {
                         attachment.withWatermark(metadataWatermark),
                         parent,
                         generation,
-                        bindSecret);
+                        bindSecret,
+                        context);
                 if (routes.size() >= MAX_ROUTES) {
                     routes.clear();
                 }
@@ -352,7 +355,12 @@ final class PollRouter {
             if (data == null || attached == null) {
                 return CompletableFuture.failedFuture(notAccepted());
             }
-            return data.sendPrimaryPoll(Unpooled.wrappedBuffer(poll.payload), attached.generation)
+            synchronized (poll) {
+                if (poll.context == null) {
+                    poll.context = route.context;
+                }
+            }
+            return data.sendPrimaryPoll(Unpooled.wrappedBuffer(poll.payload), attached.generation, poll.context)
                     .whenComplete((response, error) -> {
                         if (error != null) {
                             if (isNotAccepted(error)) {
@@ -442,6 +450,7 @@ final class PollRouter {
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
         private volatile Slot activeSlot;
+        private PartitionContext context;
         private boolean retryingRefusal;
 
         private Poll(String key, byte[] payload, Duration pollTimeout) {
@@ -488,7 +497,8 @@ final class PollRouter {
             Attachment attachment,
             AsyncTcpConnection parent,
             long generation,
-            byte[] bindSecret) {}
+            byte[] bindSecret,
+            PartitionContext context) {}
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
         private Attachment {

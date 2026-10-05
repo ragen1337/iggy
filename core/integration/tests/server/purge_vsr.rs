@@ -19,11 +19,13 @@
 //! restart (`purge.gen`), and purged journal-resident batches stay fenced
 //! behind the purge floor instead of resurfacing through the shutdown flush.
 //! Plus read-your-purge: the counters a purge acks are visible to the very
-//! next read, without waiting for the reconciler's on-disk reset.
+//! next read, after every affected partition has completed its durable reset.
 
 use crate::server::scenarios::purge_delete_scenario;
 use iggy::prelude::*;
+use integration::harness::disk;
 use integration::iggy_harness;
+use std::time::Duration;
 
 // Single node: the tests reason about ONE replica's on-disk state across a
 // restart (`purge.gen` hydration, shutdown-flush fencing); a cluster would
@@ -46,10 +48,97 @@ async fn given_journal_resident_messages_when_purged_should_not_resurface(
     purge_delete_scenario::run_resident_purge_no_resurface(harness).await;
 }
 
-// No sleep, no poll: the purge acks on commit and the segment prune runs later
-// on the reconciler, so the reset of the counters `get_topic` / `get_stream`
-// read has to happen in the replicated apply. A retry loop here would pass
-// against the pre-apply behavior too.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_offline_replica_when_purge_completes_should_preserve_every_partition_after_crash(
+    harness: &mut TestHarness,
+) {
+    const PARTITIONS: u32 = 2;
+    const DEADLINE: Duration = Duration::from_secs(60);
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream = client.create_stream("purge-quorum").await.unwrap();
+    let stream_id = Identifier::numeric(stream.id).unwrap();
+    let topic = client
+        .create_topic(
+            &stream_id,
+            "purge-quorum",
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                durability: Durability::Replicated,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic_id = Identifier::numeric(topic.id).unwrap();
+    for partition_id in 0..PARTITIONS {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload("retiring history".into())
+                .build()
+                .unwrap(),
+        ];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+    let primary = disk::leader_node_index(harness).await;
+    harness
+        .kill_node((primary + 1) % harness.cluster_size())
+        .unwrap();
+    tokio::time::timeout(DEADLINE, client.purge_topic(&stream_id, &topic_id))
+        .await
+        .expect("durable quorum completion must not wait for every replica")
+        .unwrap();
+    let completed = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.messages_count, 0);
+    assert_eq!(completed.partitions.len(), PARTITIONS as usize);
+    for partition in &completed.partitions {
+        assert_eq!(partition.context.history.purge_generation, 1);
+    }
+
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let recovered_client = harness.tcp_root_client().await.unwrap();
+    let recovered = recovered_client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for (before, after) in completed.partitions.iter().zip(&recovered.partitions) {
+        assert_eq!(after.context.history, before.context.history);
+        let polled = recovered_client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                Some(after.id),
+                &Consumer::default(),
+                &PollingStrategy::first(),
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            polled.messages.is_empty(),
+            "partition {} resurrected purged data",
+            after.id
+        );
+        assert_eq!(polled.context.history, before.context.history);
+    }
+}
+
+// Check immediately: successful completion includes durable partition reset and
+// metadata finalization. A retry loop could hide an acknowledgement sent too early.
 #[iggy_harness(
     test_client_transport = [Tcp]
 )]

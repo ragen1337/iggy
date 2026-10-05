@@ -19,6 +19,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using Apache.Iggy.Utils;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
@@ -50,6 +51,23 @@ internal static class MockFrames
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
+        if (request.Code == CommandCodes.GET_SEND_CONTEXT_CODE)
+        {
+            var context = new byte[32];
+            BinaryPrimitives.WriteUInt64LittleEndian(context, 17);
+            BinaryPrimitives.WriteUInt64LittleEndian(context.AsSpan(24), 1);
+            return Reply(OPERATION_NON_REPLICATED, context);
+        }
+        if (request.Code is CommandCodes.GET_POLL_ROUTING_CODE or CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE)
+        {
+            var route = new byte[64];
+            BinaryPrimitives.WriteUInt128LittleEndian(route, request.ClientId);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(16), request.Session);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(24), 1);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(32), 17);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(56), 1);
+            return Reply(OPERATION_NON_REPLICATED, route);
+        }
         if (request.Code == BIND_SESSION_CODE)
         {
             return Reply(OPERATION_NON_REPLICATED, RegisterBody(request.Session)[4..]);

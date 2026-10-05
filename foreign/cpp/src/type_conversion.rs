@@ -23,7 +23,8 @@ use iggy::prelude::{
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
     Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
     IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
-    Partition as RustPartition, PolledMessages as RustPolledMessages,
+    Partition as RustPartition, PartitionContext as RustPartitionContext,
+    PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
     StreamDetails as RustStreamDetails, Topic as RustTopic,
@@ -461,6 +462,19 @@ impl TryFrom<ffi::Permissions> for RustPermissions {
     }
 }
 
+impl From<RustPartitionContext> for ffi::PartitionContext {
+    fn from(context: RustPartitionContext) -> Self {
+        Self {
+            history: ffi::PartitionHistory {
+                incarnation: context.history.incarnation,
+                purge_generation: context.history.purge_generation,
+            },
+            owner_generation: context.owner_generation,
+            metadata_op: context.metadata_op,
+        }
+    }
+}
+
 impl From<RustPartition> for ffi::Partition {
     fn from(partition: RustPartition) -> Self {
         ffi::Partition {
@@ -468,6 +482,7 @@ impl From<RustPartition> for ffi::Partition {
             created_at: partition.created_at.as_micros(),
             segments_count: partition.segments_count,
             current_offset: partition.current_offset,
+            context: partition.context.into(),
             size_bytes: partition.size.as_bytes_u64(),
             messages_count: partition.messages_count,
         }
@@ -619,6 +634,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             },
             durability,
             consumer_offset_durability,
+            partition_resize_policy: None,
             messages_required_to_save: if options.has_messages_required_to_save {
                 Some(options.messages_required_to_save)
             } else {
@@ -991,6 +1007,7 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
         ffi::PolledMessages {
             partition_id: messages.partition_id,
             current_offset: messages.current_offset,
+            context: messages.context.into(),
             count: messages.count,
             messages: messages
                 .messages

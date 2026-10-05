@@ -375,7 +375,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     });
 }
 
-fn capture_offset_attachment(
+pub fn capture_offset_attachment(
     streams: &metadata::stm::stream::Streams,
     namespace: IggyNamespace,
     body: &[u8],
@@ -592,6 +592,28 @@ where
             .ok_or(ReadPolledMessagesError::Rejected(
                 IggyError::TransientNotAccepted,
             ))?;
+        let context = metadata.context(current_metadata_commit(shard));
+        let header = request.header();
+        if header.partition_incarnation != context.history.incarnation
+            || header.purge_generation != context.history.purge_generation
+        {
+            return Err(ReadPolledMessagesError::Rejected(
+                IggyError::HistoryUnavailable,
+            ));
+        }
+        if header.owner_generation != context.owner_generation {
+            return Err(ReadPolledMessagesError::Rejected(
+                IggyError::ConsumerGroupPartitionNotOwned(
+                    u32::try_from(group_id.unwrap_or(0)).unwrap_or(u32::MAX),
+                    partition_id,
+                ),
+            ));
+        }
+        if header.minimum_metadata_op > context.metadata_op {
+            return Err(ReadPolledMessagesError::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+        }
         PartitionRead::PollOnPrimary {
             consumer,
             args,
@@ -601,10 +623,15 @@ where
             },
         }
     } else {
-        PartitionRead::Poll { consumer, args }
+        PartitionRead::Poll {
+            consumer,
+            args,
+            metadata: None,
+        }
     };
     match shard.partition_read(namespace, read).await {
         Some(PartitionReadReply::Poll {
+            context,
             fragments,
             current_offset,
         }) => build_polled_messages_reply(
@@ -612,6 +639,7 @@ where
             current_metadata_commit(shard),
             partition_id,
             current_offset,
+            context,
             fragments,
             shard.plane.partitions().config().encryptor.as_deref(),
         )
@@ -818,10 +846,16 @@ where
 /// requires at least this header, so failure paths must never reply a
 /// zero-byte body.
 fn empty_polled_messages_body(partition_id: u32) -> Bytes {
-    let mut body = Vec::with_capacity(16);
+    let mut body = Vec::with_capacity(
+        16 + iggy_binary_protocol::primitives::partition_history::PartitionContext::ENCODED_SIZE,
+    );
     body.extend_from_slice(&partition_id.to_le_bytes());
     body.extend_from_slice(&0u64.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(
+        &iggy_binary_protocol::primitives::partition_history::PartitionContext::default()
+            .to_le_bytes(),
+    );
     Bytes::from(body)
 }
 
@@ -1279,6 +1313,7 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use metadata::IggyMetadata;
     use metadata::stm::StateMachine as _;
+    use metadata::stm::lifecycle::CompleteLifecycleRequest;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::{PartitionLocation, ShardId};
@@ -1313,6 +1348,7 @@ mod tests {
                 .to_bytes(),
             ))
             .unwrap();
+        complete_segment_delete_purge(&shard);
         let body = DeleteSegmentsRequest {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
@@ -1407,6 +1443,7 @@ mod tests {
                         .to_bytes(),
                     ))
                     .unwrap();
+                complete_segment_delete_purge(&shard);
             };
             let (resolved, ()) = futures::join!(
                 resolve_delete_segments_truncate(&shard, request.header(), CLIENT, 1, &body),
@@ -2610,6 +2647,33 @@ mod tests {
         );
     }
 
+    fn complete_segment_delete_purge(shard: &TestShard) {
+        let metadata = shard.plane.metadata();
+        let intents = metadata.mux_stm.streams().pending_lifecycles();
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.partitions.len(), 1);
+        let partition = &intent.partitions[0];
+        let reply = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CompleteLifecycle,
+                1,
+                1,
+                &CompleteLifecycleRequest {
+                    metadata_op: intent.context.metadata_op,
+                    stream_id: intent.stream_id,
+                    topic_id: partition.topic_id,
+                    partition_id: partition.partition_id,
+                    partition_op: 1,
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(reply.code, 0);
+        assert!(!metadata.mux_stm.streams().has_pending_lifecycles());
+    }
+
     fn create_segment_delete_topic(shard: &TestShard) -> (IggyNamespace, u64) {
         let metadata = shard.plane.metadata();
         metadata.mux_stm.users().ensure_root_user("iggy", "hash");
@@ -2672,11 +2736,7 @@ mod tests {
             namespace,
             partition_id,
             PollingConsumer::Consumer(consumer_id, usize::try_from(partition_id).unwrap()),
-            PollingArgs {
-                strategy: PollingStrategy::offset(0),
-                count: 1,
-                auto_commit: true,
-            },
+            PollingArgs::new(PollingStrategy::offset(0), 1, true),
         );
         match read_polled_messages(
             shard,

@@ -218,6 +218,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 10,
                           "count": 1,
+                          "context": {
+                            "history": {"incarnation": 17, "purge_generation": 4},
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -254,6 +259,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 10,
                           "count": 1,
+                          "context": {
+                            "history": {"incarnation": 17, "purge_generation": 4},
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -347,6 +357,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 0,
                           "count": 1,
+                          "context": {
+                            "history": {"incarnation": 17, "purge_generation": 4},
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {

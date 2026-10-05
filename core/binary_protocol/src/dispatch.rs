@@ -188,6 +188,7 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(GET_POLL_ROUTING_CODE, "message.poll_routing"),
     CommandMeta::non_replicated(POLL_MESSAGES_ON_PRIMARY_CODE, "message.poll_primary"),
     CommandMeta::non_replicated(GET_CONSUMER_OFFSET_ROUTING_CODE, "consumer_offset.routing"),
+    CommandMeta::non_replicated(GET_SEND_CONTEXT_CODE, "message.send_context"),
 ];
 
 /// Lookup command metadata by command code.
@@ -253,6 +254,7 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         GET_POLL_ROUTING_CODE => 51,
         POLL_MESSAGES_ON_PRIMARY_CODE => 52,
         GET_CONSUMER_OFFSET_ROUTING_CODE => 53,
+        GET_SEND_CONTEXT_CODE => 54,
         _ => return None,
     };
     Some(&COMMAND_TABLE[idx])
@@ -301,7 +303,11 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::Logout
         | Operation::NonReplicated
         | Operation::FinalizeSession
-        | Operation::RetireSession => return None,
+        | Operation::RetireSession
+        | Operation::CompleteLifecycle
+        | Operation::TransitionPartitionHistory
+        | Operation::InstallConsumerGroupOwner
+        | Operation::RetireConsumerGroupOwners => return None,
     };
     Some(&COMMAND_TABLE[idx])
 }

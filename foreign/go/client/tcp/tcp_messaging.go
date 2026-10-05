@@ -186,3 +186,61 @@ func (c *IggyTcpClient) pollPartition(
 
 	return binaryserialization.DeserializeFetchMessagesResponse(buffer, c.MessageCompression)
 }
+
+func (c *IggyTcpClient) capturePartitionContext(ctx context.Context, cmd command.Command) (context.Context, error) {
+	if _, captured := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); captured {
+		return ctx, nil
+	}
+	var routeCommand command.Command
+	routeCode := command.GetPollRoutingCode
+	switch request := cmd.(type) {
+	case *command.SendMessages:
+		if request.Partitioning.Kind != iggcon.PartitionIdKind || len(request.Partitioning.Value) != 4 {
+			return ctx, ierror.ErrInvalidCommand
+		}
+		stream, err := request.StreamId.MarshalBinary()
+		if err != nil {
+			return ctx, err
+		}
+		topic, err := request.TopicId.MarshalBinary()
+		if err != nil {
+			return ctx, err
+		}
+		payload := append(append(stream, topic...), request.Partitioning.Value...)
+		response, err := c.SendBinaryRequest(ctx, uint32(command.GetSendContextCode), payload)
+		if err != nil {
+			return ctx, err
+		}
+		var captured iggcon.PartitionContext
+		if err := captured.UnmarshalBinary(response); err != nil {
+			return ctx, err
+		}
+		return context.WithValue(ctx, capturedPartitionContext{}, captured), nil
+	case *command.PollMessages:
+		routeCommand = request
+	case *command.StoreConsumerOffsetRequest:
+		routeCommand = &command.GetConsumerOffset{StreamId: request.StreamId, TopicId: request.TopicId,
+			Consumer: request.Consumer, PartitionId: request.PartitionId}
+		routeCode = command.GetOffsetRoutingCode
+	case *command.DeleteConsumerOffset:
+		routeCommand = &command.GetConsumerOffset{StreamId: request.StreamId, TopicId: request.TopicId,
+			Consumer: request.Consumer, PartitionId: request.PartitionId}
+		routeCode = command.GetOffsetRoutingCode
+	default:
+		return ctx, nil
+	}
+	payload, err := routeCommand.MarshalBinary()
+	if err != nil {
+		return ctx, err
+	}
+	keyBytes := payload
+	if routeCode == command.GetPollRoutingCode {
+		keyBytes = payload[:len(payload)-pollParametersSize]
+	}
+	key := string([]byte{byte(routeCode)}) + string(keyBytes)
+	route, err := c.consumerRoute(ctx, key, payload, routeCode)
+	if err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, capturedPartitionContext{}, route.context), nil
+}

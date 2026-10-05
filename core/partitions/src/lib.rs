@@ -134,6 +134,13 @@ pub struct RetainedPartitionState {
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
     pub external_group_offsets: Vec<(u32, u64)>,
+    pub(crate) consumer_group_owners:
+        std::collections::BTreeMap<u64, iggy_partition::InstalledConsumerGroupOwner>,
+    pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,
+    pub(crate) owner_retirement:
+        Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
+    pub(crate) applied_purge_generation: u64,
+    pub(crate) purge_floor_op: u64,
 }
 
 /// Partition-level data plane operations.

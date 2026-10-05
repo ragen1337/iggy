@@ -23,6 +23,10 @@ it('translates the partitions capacity error', () => {
   assert.equal(translateErrorCode(2022), 'Partitions limit reached, raise [metadata] partitions_max');
 });
 
+it('translates the fixed-topic resize error', () => {
+  assert.equal(translateErrorCode(2023), 'Partition resizing is disabled for this fixed topic');
+});
+
 it('reports an unknown outcome for an aged-out request', () => {
   assert.equal(
     translateErrorCode(85),

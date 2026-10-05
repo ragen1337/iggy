@@ -59,7 +59,7 @@ const PRODUCE_BATCH_ONLY =
   "6865616465722d6279746573";
 
 const POLL_BODY =
-  "0300000065000000000000000200000003000000000000006400000000000000" +
+  "03000000650000000000000002000000110000000000000004000000000000000900000000000000340000000000000003000000000000006400000000000000" +
   "8813000000000000e8030000000000008c01000000000000c96826b38a8feed2" +
   "0200000000000000000000000000000000000000000000000000000000000000" +
   "0000000000000000000000000000000000000000000000000000000000000000" +
@@ -117,7 +117,7 @@ describe("message batch golden vectors", () => {
     assert.equal(body.readBigUInt64LE(4), 101n);
     assert.equal(body.readUInt32LE(12), 2);
 
-    const messages = deserializeBatchMessages(body, 16);
+    const messages = deserializeBatchMessages(body, 48);
     assert.equal(messages.length, 2);
 
     assert.equal(messages[0].id, 7n);
@@ -139,9 +139,9 @@ describe("message batch golden vectors", () => {
 
   it("rejects a non-zero reserved frame field", () => {
     const body = Buffer.from(POLL_BODY, "hex");
-    body.writeUInt8(1, 16 + BATCH_HEADER_SIZE + 40);
+    body.writeUInt8(1, 48 + BATCH_HEADER_SIZE + 40);
     assert.throws(
-      () => deserializeBatchMessages(body, 16),
+      () => deserializeBatchMessages(body, 48),
       /reserved/,
     );
   });
@@ -185,7 +185,7 @@ describe("message batch golden vectors", () => {
     stamped.baseTimestamp = 5_000_000n;
     serializeBatchHeader(stamped).copy(batch);
 
-    const envelope = Buffer.alloc(16);
+    const envelope = Buffer.alloc(48);
     envelope.writeUInt32LE(3, 0);
     envelope.writeBigUInt64LE(101n, 4);
     envelope.writeUInt32LE(2, 12);

@@ -61,7 +61,7 @@ public sealed class MessageBatchGoldenVectorTests
         "6865616465722d6279746573";
 
     private const string PollBody =
-        "03000000650000000000000002000000030000000000000064000000000000008813000000000000e803000000000000" +
+        "030000006500000000000000020000001100000000000000040000000000000009000000000000003400000000000000030000000000000064000000000000008813000000000000e803000000000000" +
         "8c01000000000000c96826b38a8feed20200000000000000000000000000000000000000000000000000000000000000" +
         "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
         "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
@@ -144,6 +144,7 @@ public sealed class MessageBatchGoldenVectorTests
         Assert.Equal(3u, rental.PartitionId);
         Assert.Equal(101ul, rental.CurrentOffset);
         Assert.Equal(2, rental.Messages.Count);
+        Assert.Equal(new Apache.Iggy.Contracts.PartitionContext(new(17, 4), 9, 52), rental.Context);
 
         var first = rental.Messages[0];
         Assert.Equal(100ul, first.Header.Offset);
@@ -152,7 +153,7 @@ public sealed class MessageBatchGoldenVectorTests
         Assert.Equal(new UInt128(0, 7), first.Header.Id);
         Assert.Equal("first-payload"u8.ToArray(), first.Payload.ToArray());
         Assert.True(first.RawUserHeaders.IsEmpty);
-        Assert.Equal(BinaryPrimitives.ReadUInt64LittleEndian(pollBody.AsSpan(16 + 256, 8)), first.Header.Checksum);
+        Assert.Equal(BinaryPrimitives.ReadUInt64LittleEndian(pollBody.AsSpan(48 + 256, 8)), first.Header.Checksum);
 
         var second = rental.Messages[1];
         Assert.Equal(101ul, second.Header.Offset);
@@ -162,7 +163,7 @@ public sealed class MessageBatchGoldenVectorTests
         Assert.Equal("second-payload"u8.ToArray(), second.Payload.ToArray());
         Assert.Equal("user-header-bytes"u8.ToArray(), second.RawUserHeaders.ToArray());
         Assert.Equal(
-            BinaryPrimitives.ReadUInt64LittleEndian(pollBody.AsSpan(16 + 256 + 48 + "first-payload"u8.Length, 8)),
+            BinaryPrimitives.ReadUInt64LittleEndian(pollBody.AsSpan(48 + 256 + 48 + "first-payload"u8.Length, 8)),
             second.Header.Checksum);
     }
 

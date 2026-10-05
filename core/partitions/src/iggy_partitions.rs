@@ -712,14 +712,6 @@ where
         })
     }
 
-    /// Drop a group's ephemeral `last_polled` mark on the partition for
-    /// `namespace`. `None` for a missing/tombstoned namespace.
-    pub fn clear_group_last_polled(&self, namespace: &IggyNamespace, group_id: u64) -> Option<()> {
-        self.with_partition(namespace, |partition| {
-            partition.clear_group_last_polled(group_id);
-        })
-    }
-
     /// Resolve a `DeleteSegments` count to the `end_offset` of the `count`-th
     /// oldest sealed segment on the partition for `namespace`. The outer `None`
     /// is a missing/tombstoned namespace; the inner `None` is a partition with

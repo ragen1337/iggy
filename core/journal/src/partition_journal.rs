@@ -700,8 +700,14 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         {
             return Ok(());
         }
+        // A primary may retire sessions while a backup still applies the fence.
+        // Inline control records after the cutoff own no segment bytes to purge.
         if floor > self.state.head
-            || (self.state.segment_storage.is_some() && floor < self.state.head)
+            || (self.state.segment_storage.is_some()
+                && self
+                    .entries
+                    .range(floor..)
+                    .any(|(op, entry)| *op > floor && entry.reference.is_some()))
         {
             return Err(invalid("purge must cover the owned segment history"));
         }
@@ -2983,6 +2989,60 @@ mod tests {
             Some(SegmentPosition::default())
         );
         assert_eq!(journal.prepares().await.unwrap().len(), 1);
+    }
+
+    #[compio::test]
+    async fn given_retirement_after_a_history_fence_when_purging_should_preserve_the_suffix() {
+        const BODY_BYTES: usize = 4096;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let fence = prepare(2, first.header().checksum).transmute_header(
+            |original, header: &mut PrepareHeader| {
+                *header = original;
+                header.operation = Operation::TransitionPartitionHistory;
+                header.checksum = header.identity_checksum();
+            },
+        );
+        let retirement = prepare(3, fence.header().checksum).transmute_header(
+            |original, header: &mut PrepareHeader| {
+                *header = original;
+                header.operation = Operation::RetireSession;
+                header.checksum = header.identity_checksum();
+            },
+        );
+        journal
+            .append_batch_buffered(&[
+                first.into_frozen(),
+                fence.into_frozen(),
+                retirement.clone().into_frozen(),
+            ])
+            .await
+            .unwrap();
+        journal.mark_purge(1, 2).await.unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.purge_marker(), (1, 2));
+        assert_eq!(journal.head(), 3);
+        assert_eq!(
+            journal.segment_checkpoint(),
+            Some(SegmentPosition::default())
+        );
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.last().unwrap().as_slice(), retirement.as_slice());
+        let replacement = segment_prepare(4, retirement.header().checksum, 0, BODY_BYTES);
+        journal.append(replacement.into_frozen()).await.unwrap();
+        assert_eq!(journal.head(), 4);
     }
 
     #[compio::test]

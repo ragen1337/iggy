@@ -810,6 +810,7 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             raw: options.unwrap_or_default(),
+            partition_resize_policy: None,
         };
 
         let stream = Identifier::try_from(stream)?;

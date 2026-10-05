@@ -116,7 +116,7 @@ func pollRoutingReply(t *testing.T, read request, endpoint string, watermark uin
 	node, err := decoded.Nodes[0].MarshalBinary()
 	require.NoError(t, err)
 	parent := consumerSession{client: read.clientID(), session: read.sessionID(), watermark: watermark}
-	return replyFrame(vsr.OperationNonReplicated, append(parent.bytes(), node...))
+	return replyFrame(vsr.OperationNonReplicated, append(append(parent.bytes(), make([]byte, iggcon.PartitionContextSize)...), node...))
 }
 
 func pollPrimaryPartition(ctx context.Context, client *IggyTcpClient, partition uint32) (*iggcon.PolledMessage, error) {
@@ -618,7 +618,7 @@ func TestPrimaryPoll_UnknownTopologyCanRecoverAsStandalone(t *testing.T) {
 	assert.False(t, fixture.client.clustered.Load())
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetClusterMetadataCode))
-	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
+	assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
 	assert.Zero(t, fixture.primaries[0].connections())
 }
 

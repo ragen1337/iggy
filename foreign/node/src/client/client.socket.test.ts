@@ -254,6 +254,10 @@ const singleNodeHandler = (port: number): FrameHandler =>
       );
       return;
     }
+    if (code === COMMAND_CODE.GetPollRouting || code === COMMAND_CODE.GetConsumerOffsetRouting) {
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame, port, 1n)));
+      return;
+    }
     socket.write(replyFrame(operation));
   };
 
@@ -312,7 +316,7 @@ const routingBody = (request: Buffer, port: number, watermark: bigint): Buffer =
   attachment.writeBigUInt64LE(watermark, 24);
   const metadata = singleNodeMetadataBody(port);
   const nodeOffset = 4 + metadata.readUInt32LE(0) + 4;
-  return Buffer.concat([attachment, metadata.subarray(nodeOffset)]);
+  return Buffer.concat([attachment, Buffer.alloc(32), metadata.subarray(nodeOffset)]);
 };
 
 const countCommand = (server: VsrTestServer, code: number): number =>
@@ -451,9 +455,9 @@ describe('primary auto-commit polling', () => {
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(false));
       await standalone.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), 1);
-      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 0);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 1);
       assert.equal(countCommand(server, COMMAND_CODE.PollMessages), 1);
-      assert.equal(countCommand(server, COMMAND_CODE.GetPollRouting), 0);
+      assert.equal(countCommand(server, COMMAND_CODE.GetPollRouting), 1);
     } finally {
       standalone.destroy();
       await cluster.close();
@@ -609,7 +613,7 @@ describe('primary auto-commit polling', () => {
           await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata), reads);
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), standalone ? 2 : 0);
-          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), standalone ? 0 : 1);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), standalone ? 2 : 1);
           assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), standalone ? 0 : 2);
           assert.equal(resets, 0);
         } finally {

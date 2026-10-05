@@ -62,6 +62,17 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
+    struct PartitionHistory {
+        incarnation: u64,
+        purge_generation: u64,
+    }
+
+    struct PartitionContext {
+        history: PartitionHistory,
+        owner_generation: u64,
+        metadata_op: u64,
+    }
+
     struct Partition {
         id: u32,
         created_at: u64,
@@ -69,6 +80,7 @@ mod ffi {
         current_offset: u64,
         size_bytes: u64,
         messages_count: u64,
+        context: PartitionContext,
     }
 
     struct TopicDetails {
@@ -172,6 +184,7 @@ mod ffi {
         current_offset: u64,
         count: u32,
         messages: Vec<IggyMessagePolled>,
+        context: PartitionContext,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.

@@ -35,8 +35,9 @@ import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.comma
 import { deserializeNode } from '../wire/cluster/cluster.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { serializeIdentifier } from '../wire/identifier.utils.js';
+import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import {
-  Command, HEADER_SIZE, REPLY_OFFSET, peekCommand, readReplyOperation, readStatus
+  Command, HEADER_SIZE, REPLY_OFFSET, PARTITION_CONTEXT_SIZE, deserializePartitionContext, type PartitionContext, peekCommand, readReplyOperation, readStatus
 } from '../wire/vsr/header.js';
 import { Operation, isKnownOperation } from '../wire/vsr/operation.js';
 import {
@@ -59,14 +60,21 @@ const TRANSIENT_NOT_ACCEPTED = 58;
 const UNAUTHENTICATED = 40;
 const UNAUTHORIZED = 41;
 const STALE_CLIENT = 30;
+const HISTORY_UNAVAILABLE = 87;
 const FEATURE_UNAVAILABLE = 5;
 const MAX_POLL_ROUTES = 4096;
 const MAX_POLL_CONNECTIONS = 256;
 const CONSUMER_SESSION_SIZE = 32;
 const METADATA_WATERMARK_OFFSET = 24;
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
+const IDENTIFIER_PREFIX_SIZE = 2;
+const SEND_METADATA_LENGTH_SIZE = 4;
+const PARTITION_ID_SIZE = 4;
+const STORE_OFFSET_SUFFIX_SIZE = 8 + 1;
+const DELETE_OFFSET_SUFFIX_SIZE = 1;
 
 type PollRoute = {
+  context: PartitionContext,
   endpoint: Endpoint,
   attachment: Buffer,
 };
@@ -127,6 +135,7 @@ const UNLOGGED_COMMAND_CODE = [
  * Represents a queued command job waiting to be executed.
  */
 type Job = {
+  context?: PartitionContext,
   /** Command code */
   command: number,
   /** Command payload */
@@ -358,13 +367,14 @@ export class CommandResponseStream extends EventEmitter {
       // after a move keeps the budget it was first submitted with, rather than
       // opening a second one.
       const deadline = options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS;
+      const context = await this._capturePartitionContext(command, payload, deadline);
       let response: CommandResponse;
       let walkingRoster = false;
       const visitedRosterEndpoints = new Set<string>();
       for (;;) {
         try {
           response = await this._queueCommand(command, payload, handleResponse,
-            last, followsLeaderMoves, deadline);
+            last, followsLeaderMoves, deadline, context);
           break;
         } catch (error) {
           if (!(error instanceof LeaderMovedError))
@@ -446,17 +456,59 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
+  private async _capturePartitionContext(
+    command: number,
+    payload: Buffer,
+    deadline: number
+  ): Promise<PartitionContext | undefined> {
+    if (command === COMMAND_CODE.SendMessages) {
+      let position = SEND_METADATA_LENGTH_SIZE;
+      for (let identifier = 0; identifier < 2; identifier++) {
+        if (position + IDENTIFIER_PREFIX_SIZE > payload.length)
+          return undefined;
+        position += IDENTIFIER_PREFIX_SIZE + payload[position + 1];
+      }
+      if (position + IDENTIFIER_PREFIX_SIZE + PARTITION_ID_SIZE > payload.length ||
+          payload[position] !== PartitionKind.PartitionId ||
+          payload[position + 1] !== PARTITION_ID_SIZE)
+        return undefined;
+      const query = Buffer.concat([
+        payload.subarray(SEND_METADATA_LENGTH_SIZE, position),
+        payload.subarray(position + IDENTIFIER_PREFIX_SIZE,
+          position + IDENTIFIER_PREFIX_SIZE + PARTITION_ID_SIZE)
+      ]);
+      const response = await this.sendCommand(COMMAND_CODE.GetSendContext, query, { deadline });
+      return deserializePartitionContext(response.data);
+    }
+    let query = payload;
+    let queryCode = COMMAND_CODE.GetPollRouting;
+    if (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset) {
+      const suffix = command === COMMAND_CODE.StoreOffset
+        ? STORE_OFFSET_SUFFIX_SIZE : DELETE_OFFSET_SUFFIX_SIZE;
+      if (payload.length <= suffix)
+        return undefined;
+      query = payload.subarray(0, -suffix);
+      queryCode = COMMAND_CODE.GetConsumerOffsetRouting;
+    } else if (command !== COMMAND_CODE.PollMessages || payload.length <= POLL_OPTIONS_SIZE) {
+      return undefined;
+    }
+    const response = await this.sendCommand(queryCode, query, { deadline });
+    return deserializePartitionContext(response.data, CONSUMER_SESSION_SIZE);
+  }
+
   private _queueCommand(
     command: number,
     payload: Buffer,
     handleResponse: boolean,
     last: boolean,
     followsLeaderMoves: boolean,
-    deadline: number
+    deadline: number,
+    context?: PartitionContext
   ): Promise<CommandResponse> {
     return new Promise<CommandResponse>((resolve, reject) => {
       const job: Job = {
         command,
+        context,
         payload,
         handleResponse,
         last,
@@ -590,6 +642,7 @@ export class CommandResponseStream extends EventEmitter {
     handleResponse: boolean
   ): Promise<CommandResponse> {
     const key = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
+    let captured: PartitionContext | undefined;
     while (Date.now() < deadline && !this.connection.ending) {
       try {
         const generation = this.routingGeneration;
@@ -601,10 +654,10 @@ export class CommandResponseStream extends EventEmitter {
             this._pollRoutingControl(payload, deadline), deadline);
           if (generation !== this.routingGeneration)
             throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
-          if (response.data.length < CONSUMER_SESSION_SIZE)
+          if (response.data.length < CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE)
             throw new Error('poll routing response is incomplete');
-          const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE);
-          if (node.length + CONSUMER_SESSION_SIZE !== response.data.length || !node.data.ip)
+          const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE);
+          if (node.length + CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE !== response.data.length || !node.data.ip)
             throw new Error('poll routing response has no valid TCP endpoint');
           if (node.data.endpoints.tcp === 0)
             throw responseError(COMMAND_CODE.PollMessages, FEATURE_UNAVAILABLE);
@@ -612,6 +665,7 @@ export class CommandResponseStream extends EventEmitter {
           if (attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) < this.metadataWatermark)
             attachment.writeBigUInt64LE(this.metadataWatermark, METADATA_WATERMARK_OFFSET);
           route = {
+            context: deserializePartitionContext(response.data, CONSUMER_SESSION_SIZE),
             endpoint: { host: node.data.ip, port: node.data.endpoints.tcp },
             attachment
           };
@@ -620,6 +674,7 @@ export class CommandResponseStream extends EventEmitter {
           this.pollRoutes.set(key, route);
         }
 
+        captured ??= route.context;
         const endpoint = endpointKey(route.endpoint);
         let entry = this.pollConnections.get(endpoint);
         if (!entry) {
@@ -669,7 +724,7 @@ export class CommandResponseStream extends EventEmitter {
             throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
           polling = true;
           return await entry.client._queueCommand(COMMAND_CODE.PollMessagesOnPrimary,
-            payload, handleResponse, true, false, deadline);
+            payload, handleResponse, true, false, deadline, captured);
         } catch (error) {
           if (error instanceof ResponseError &&
               error.errorCode === TRANSIENT_NOT_ACCEPTED) {
@@ -807,7 +862,7 @@ export class CommandResponseStream extends EventEmitter {
       if (!next) break;
       const { command, payload, handleResponse, deadline, resolve, reject } = next;
       try {
-        resolve(await this._processNext(command, payload, handleResponse, deadline));
+        resolve(await this._processNext(command, payload, handleResponse, deadline, next.context));
       } catch (err) {
         if (err instanceof LeaderMovedError && next.followsLeaderMoves)
           // Counted before the rejection is handed out, not after: the caller
@@ -854,11 +909,12 @@ export class CommandResponseStream extends EventEmitter {
     command: number,
     payload: Buffer,
     handleResp = true,
-    deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS
+    deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS,
+    context?: PartitionContext
   ): Promise<CommandResponse> {
     if (isLoginCommand(command))
       return this._processVsrLogin(command, payload, handleResp, deadline);
-    return this._processVsr(command, payload, handleResp, deadline);
+    return this._processVsr(command, payload, handleResp, deadline, context);
   }
 
   private async _processVsrLogin(
@@ -895,13 +951,14 @@ export class CommandResponseStream extends EventEmitter {
     command: number,
     payload: Buffer,
     handleResp: boolean,
-    deadline: number
+    deadline: number,
+    context?: PartitionContext
   ): Promise<CommandResponse> {
     let requestWritten = false;
     try {
       const prepared = prepareVsrCommand(command, payload, this.vsrSession.bindSecret);
       // A transient retry must preserve all request identity fields.
-      const frame = this.vsrSession.encode(prepared.command, prepared.payload);
+      const frame = this.vsrSession.encode(prepared.command, prepared.payload, context);
       // Derived from the request's own budget rather than read off the clock,
       // so one request spends one budget however many times it is re-issued.
       const notAcceptedDeadline =
@@ -942,6 +999,7 @@ export class CommandResponseStream extends EventEmitter {
           if (error instanceof ResponseError &&
               lastTransientError?.errorCode === TRANSIENT_NOT_COMMITTED &&
               (error.errorCode === TRANSIENT_NOT_ACCEPTED ||
+               error.errorCode === HISTORY_UNAVAILABLE ||
                error.errorCode === UNAUTHENTICATED ||
                error.errorCode === STALE_CLIENT ||
                error.errorCode === UNAUTHORIZED))

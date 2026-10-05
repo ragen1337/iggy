@@ -189,6 +189,7 @@ class IggyErrorCodeTest {
         "83, INVALID_BOOLEAN_VALUE",
         "84, INVALID_NUMBER_VALUE",
         "85, REQUEST_TOO_OLD",
+        "87, HISTORY_UNAVAILABLE",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",
@@ -213,6 +214,7 @@ class IggyErrorCodeTest {
         "2018, INVALID_REPLICATION_FACTOR",
         "2021, TOO_MANY_TOPICS",
         "2022, PARTITIONS_LIMIT_REACHED",
+        "2023, PARTITION_RESIZE_DISABLED",
 
         // Partition errors
         "3007, PARTITION_NOT_FOUND",

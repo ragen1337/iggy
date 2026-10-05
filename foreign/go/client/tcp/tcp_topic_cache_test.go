@@ -56,7 +56,7 @@ func TestTopicCache_DropStreamForgetsEveryTopicUnderTheStream(t *testing.T) {
 
 func TestDeleteStream_DropsTheCachedTopicsOfTheStream(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.operation() == vsr.OperationSendMessages:
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())

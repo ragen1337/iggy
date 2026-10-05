@@ -107,6 +107,7 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
         path: String,
         generation: u64,
         revision: u64,
+        cutoff: u64,
     },
     RetryCheckpoint {
         path: PathBuf,
@@ -637,6 +638,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
     /// Directory syncs and the purge's offset and generation files go through
     /// `storage`. Other file work uses its disk implementation.
     #[allow(clippy::future_not_send)]
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn execute_with_storage<S: DurableStorage>(
         self,
         storage: &S,
@@ -705,8 +707,10 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                 path,
                 generation,
                 revision,
+                cutoff,
             } => PartitionIoResult::PurgeGeneration(
-                persist_purge_generation_with_storage(storage, &path, generation, revision).await,
+                persist_purge_generation_with_storage(storage, &path, generation, revision, cutoff)
+                    .await,
             ),
             Self::RetryCheckpoint { path, bytes } => PartitionIoResult::RetryCheckpoint(
                 crate::state_transfer::write_retry_checkpoint(&path, bytes).await,

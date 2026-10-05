@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { EMPTY_PARTITION_CONTEXT } from '../vsr/header.js';
 import type { Id } from '../identifier.utils.js';
 import type {
   CommandResponse,
@@ -202,6 +203,7 @@ const pollConsumerGroup = async (
     if (cursor.partitions.length === 0)
       return {
         partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
         currentOffset: 0n,
         count: 0,
         messages: []
@@ -233,6 +235,7 @@ const pollConsumerGroup = async (
   }
   return {
     partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
     currentOffset: 0n,
     count: 0,
     messages: []

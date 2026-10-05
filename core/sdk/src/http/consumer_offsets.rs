@@ -23,10 +23,30 @@ use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo};
+use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, ConsumerPosition};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        self.put(
+            &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+            &StoreConsumerOffset {
+                consumer: consumer.clone(),
+                partition_id: Some(position.partition_id),
+                offset: position.offset,
+                context: Some(position.context),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -42,6 +62,7 @@ impl ConsumerOffsetClient for HttpClient {
                 consumer: consumer.clone(),
                 partition_id,
                 offset,
+                context: None,
             },
         )
         .await?;

@@ -177,6 +177,7 @@ result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
+    UnsupportedOptionKey = 4041,
     InvalidOptionValue = 4042,
 });
 result_enum!(DeleteTopicResult {
@@ -196,12 +197,14 @@ result_enum!(CreatePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
+    PartitionResizeDisabled = 2023,
     PartitionIdSpaceExhausted = 3013,
 });
 result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
+    PartitionResizeDisabled = 2023,
 });
 // `TruncatePartition` is the committed form of a client `DeleteSegments`; an
 // unresolvable target commits as a rejection so the request sequence stays
@@ -282,6 +285,8 @@ result_enum!(LeaveConsumerGroupResult {
 /// own result enum. Pinned to the wire discriminant in
 /// [`tests::given_result_discriminants_then_match_iggy_error_codes`].
 const UNAUTHORIZED_CODE: u32 = 41;
+const LIFECYCLE_BUSY_CODE: u32 = 58;
+const INVALID_COMMAND_CODE: u32 = 3;
 
 /// True if `code` is one this op's result enum declares (`Ok = 0` included), or
 /// the global `UNAUTHORIZED_CODE`.
@@ -295,7 +300,7 @@ const UNAUTHORIZED_CODE: u32 = 41;
 pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
     // The in-apply RBAC gate can deny any control-plane op, committing an
     // `Unauthorized` no-op, so accept it globally rather than per-op enum.
-    if code == UNAUTHORIZED_CODE {
+    if code == UNAUTHORIZED_CODE || code == LIFECYCLE_BUSY_CODE || code == INVALID_COMMAND_CODE {
         return true;
     }
     match operation {

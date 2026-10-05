@@ -485,19 +485,20 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
 
-        // A pre-commit denial short-circuits everything below. The two channels are
-        // mutually exclusive: a reply either commits (status 0, result section
-        // present) or is denied before commit (status set, EMPTY body). Reading a
-        // result section off a denial finds no bytes, which the metadata branch
-        // below would report as a corrupt reply.
-        //
-        // The op never entered the log, so the shadow must not move and there is
-        // nothing to classify. Only the dispatch shell produces these, since
-        // authorization runs there, which is why this went unmodelled until the
-        // workload ran through the shell.
+        // Uncertain replies can arrive in either the status or result section.
+        // A pending lifecycle already committed its intent, so only its retained
+        // request can resolve the outcome without losing the shadow's effect.
         if header.status != 0 {
-            self.auditor.note_denial(entry.action, header.status);
-            self.release_outstanding(key);
+            if TransientRejection::from_code(header.status)
+                == Some(TransientRejection::NotCommitted)
+            {
+                self.auditor
+                    .note_transient_rejection(entry.action, header.status);
+                self.auditor.record_in_flight(key, entry);
+            } else {
+                self.auditor.note_denial(entry.action, header.status);
+                self.release_outstanding(key);
+            }
             return Vec::new();
         }
 
@@ -769,6 +770,7 @@ pub fn run_with_faults(
             if workload.is_recovering(client.client_id()) {
                 continue;
             }
+            sim.discover_partition_contexts(client);
             if let Some((target, msg)) = workload.build_request(client) {
                 sim.submit_request(client.client_id(), target, msg.into_generic());
             }

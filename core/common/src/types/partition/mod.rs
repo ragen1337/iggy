@@ -19,6 +19,8 @@ use crate::utils::byte_size::IggyByteSize;
 use crate::utils::timestamp::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 
+pub use iggy_binary_protocol::primitives::partition_history::{PartitionContext, PartitionHistory};
+
 /// `Partition` represents the information about a partition.
 /// It consists of the following fields:
 /// - `id`: unique identifier of the partition.
@@ -41,4 +43,5 @@ pub struct Partition {
     pub size: IggyByteSize,
     /// The number of messages in the partition.
     pub messages_count: u64,
+    pub context: PartitionContext,
 }

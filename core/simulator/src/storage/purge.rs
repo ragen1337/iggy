@@ -43,26 +43,32 @@
 //! process runs through `IggyPartition::purge`, so the partition crate tests it.
 //! A failed unlink leaves the generation unrecorded, including for bookmarks not
 //! loaded into memory. Restart must complete that purge before fresh history.
+//! A cleanup fault sweep also checks refused completion and idempotent cleanup
+//! after process loss or power loss; partition-log ordering is tested separately.
 
 use super::tests::owned_prepare;
 use super::{Crash, FaultMode, SimStorage, StorageOperation};
 use configs::server::ServerConfig;
 use consensus::{LocalPipeline, Sequencer, VsrConsensus};
 use futures::executor::block_on;
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_binary_protocol::{Command, Operation, PrepareHeader, RoutedRequestHeader, WireEncode};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize, PartitionStats,
     PollingStrategy, TopicRuntimeOptions,
 };
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
 use journal::{DurableAppend, PartitionPrepareJournal};
-use message_bus::IggyMessageBus;
+use message_bus::{AUTO_COMMIT_CLIENT_ID, IggyMessageBus};
 use partitions::offset_storage::{
-    persist_offset_with_storage, persist_purge_generation_with_storage,
+    persist_offset_with_storage, persist_purge_generation_with_storage, read_purge_generation,
 };
 use partitions::{
     IggyPartition, IggyPartitions, Partition, PartitionPathLayout, PartitionsConfig, PollingArgs,
     PollingConsumer, PurgeError, configure_consumer_offsets_with_storage,
 };
+use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, ShardId};
 use std::path::{Path, PathBuf};
@@ -77,6 +83,7 @@ const CONSUMER_ID: usize = 7;
 const GROUP_ID: usize = 9;
 const STRAY_ID: usize = 99;
 const FRESH_MESSAGE_COUNT: u64 = 5;
+const PURGE_CUTOFF: u64 = FRESH_MESSAGE_COUNT + 1;
 
 type TestPartition = IggyPartition<Rc<IggyMessageBus>>;
 
@@ -138,6 +145,7 @@ impl PurgeStorageHarness {
             &format!("{}/purge.gen", harness.partition_directory()),
             OLD_GENERATION,
             CREATED_REVISION,
+            0,
         )
         .await
         .unwrap();
@@ -191,12 +199,26 @@ impl PurgeStorageHarness {
         )
         .await
         .unwrap();
+        let (generation, cutoff) = read_purge_generation(
+            &self.storage,
+            &format!("{}/purge.gen", self.partition_directory()),
+            CREATED_REVISION,
+        )
+        .await
+        .unwrap();
+        journal.reset(cutoff, None).await.unwrap();
         let mut parent_checksum = 0;
         for offset in 0..FRESH_MESSAGE_COUNT {
-            let operation_number = offset + 1;
+            let operation_number = cutoff + offset + 1;
             // The helper fills the payload with the operation number, allowing
             // polls to verify message contents as well as their offsets.
-            let prepare = owned_prepare(operation_number, parent_checksum, offset);
+            let prepare = owned_prepare(operation_number, parent_checksum, offset)
+                .transmute_header(|mut original, header: &mut PrepareHeader| {
+                    original.partition_incarnation = CREATED_REVISION;
+                    original.purge_generation = generation;
+                    original.checksum = original.identity_checksum();
+                    *header = original;
+                });
             parent_checksum = prepare.header().checksum;
             journal.append(prepare.into_frozen()).await.unwrap();
         }
@@ -224,6 +246,13 @@ impl PurgeStorageHarness {
         .await
         .unwrap();
         let mut partition = self.empty_partition();
+        partition
+            .hydrate_applied_purge_generation_with_storage(&self.storage)
+            .await
+            .unwrap();
+        let cutoff = partition.purge_floor_op();
+        partition.consensus().restore_commit_state(cutoff, cutoff);
+        partition.consensus().sequencer().set_sequence(cutoff);
         for prepare in journal.prepares().await.unwrap() {
             let operation_number = prepare.header().op;
             partition.append_messages(prepare).await.unwrap();
@@ -238,6 +267,41 @@ impl PurgeStorageHarness {
         let current_offset = partition.offsets().commit_offset;
         assert_eq!(current_offset, FRESH_MESSAGE_COUNT - 1);
         self.recover_progress(&mut partition, current_offset).await;
+        let installation = InstallConsumerGroupOwnerRequest {
+            history: partition.history(),
+            group_id: GROUP_ID as u64,
+            owner: ConsumerGroupOwner {
+                client_id: 42,
+                session: 1,
+                generation: 1,
+            },
+            metadata_op: 1,
+        };
+        let body = installation.to_bytes();
+        let size = iggy_binary_protocol::HEADER_SIZE + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size).transmute_header(
+            |_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::InstallConsumerGroupOwner;
+                header.client = AUTO_COMMIT_CLIENT_ID;
+                header.session = 1;
+                header.request = installation.metadata_op;
+                header.metadata_watermark = installation.metadata_op;
+                header.group = self.namespace.inner();
+                header.partition_incarnation = CREATED_REVISION;
+                header.purge_generation = partition.history().purge_generation;
+                header.size = u32::try_from(size).unwrap();
+            },
+        );
+        request.as_mut_slice()[iggy_binary_protocol::HEADER_SIZE..].copy_from_slice(&body);
+        partition.on_request(request, None).await;
+        let op = partition.consensus().sequencer().current_sequence();
+        partition.consensus().advance_commit_max(op);
+        partition.commit_journal(&partition_config()).await;
+        assert_eq!(
+            partition.installed_consumer_group_owner(&installation),
+            Some(op)
+        );
         partition
     }
 
@@ -267,6 +331,7 @@ impl PurgeStorageHarness {
         partition: TestPartition,
         expected_offsets: &[u64],
     ) {
+        let cutoff = partition.purge_floor_op();
         let partitions = IggyPartitions::new(ShardId::new(0), partition_config());
         partitions.insert(self.namespace, partition);
         for consumer in consumers() {
@@ -274,11 +339,7 @@ impl PurgeStorageHarness {
                 .build_poll_snapshot(
                     &self.namespace,
                     consumer,
-                    &PollingArgs {
-                        strategy: PollingStrategy::next(),
-                        count: 10,
-                        auto_commit: false,
-                    },
+                    &PollingArgs::new(PollingStrategy::next(), 10, false),
                 )
                 .unwrap();
             assert!(!plan.needs_off_pump_io());
@@ -293,7 +354,8 @@ impl PurgeStorageHarness {
                     let batch = decode_batch_slice(fragment.as_slice()).unwrap();
                     assert_eq!(batch.message_count(), 1);
                     let message = batch.iter().next().unwrap();
-                    let expected_byte = u8::try_from(batch.header.base_offset + 1).unwrap();
+                    let expected_byte =
+                        u8::try_from(cutoff + batch.header.base_offset + 1).unwrap();
                     assert!(message.payload.iter().all(|byte| *byte == expected_byte));
                     batch.header.base_offset
                 })
@@ -407,9 +469,7 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
             assert_eq!(recovered.applied_purge_generation(), OLD_GENERATION);
             assert_bookmarks(&recovered, Some(STORED_OFFSET), "recovery must keep it");
             // Bookmark 2 means the first three messages were already consumed.
-            harness
-                .poll_next_and_assert_messages(recovered, &[3, 4])
-                .await;
+            Box::pin(harness.poll_next_and_assert_messages(recovered, &[3, 4])).await;
         }
     });
 }
@@ -448,7 +508,12 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
 
             // Check the purge's effects on the live partition before discarding it.
             partition
-                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(
+                    &partition_config(),
+                    &harness.storage,
+                    NEW_GENERATION,
+                    PURGE_CUTOFF,
+                )
                 .await
                 .expect("complete purge cleanup");
             assert_eq!(
@@ -506,9 +571,7 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
                     "{policy:?}, {kind:?}: recovery must find no durable bookmarks"
                 );
             }
-            harness
-                .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
-                .await;
+            Box::pin(harness.poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])).await;
         }
     });
 }
@@ -529,7 +592,12 @@ fn given_missing_offset_directory_when_purge_completes_should_record_the_generat
                 .await;
 
             partition
-                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(
+                    &partition_config(),
+                    &harness.storage,
+                    NEW_GENERATION,
+                    PURGE_CUTOFF,
+                )
                 .await
                 .unwrap_or_else(|error| {
                     panic!("{kind:?}: purge must record its generation: {error}")
@@ -573,7 +641,12 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
         traced.recover_progress(&mut partition, STORED_OFFSET).await;
         traced.storage.clear_trace();
         partition
-            .complete_purge_with_storage(&partition_config(), &traced.storage, NEW_GENERATION)
+            .complete_purge_with_storage(
+                &partition_config(),
+                &traced.storage,
+                NEW_GENERATION,
+                PURGE_CUTOFF,
+            )
             .await
             .expect("the traced purge completes");
         let external_dir_sync = traced
@@ -596,7 +669,12 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
             .fail_at(external_dir_sync, FaultMode::Before);
         assert!(matches!(
             partition
-                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(
+                    &partition_config(),
+                    &harness.storage,
+                    NEW_GENERATION,
+                    PURGE_CUTOFF
+                )
                 .await,
             Err(PurgeError::OffsetsNotDurable(_))
         ));
@@ -622,7 +700,12 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
 
         // The purge that boot runs again removes it for good.
         recovered
-            .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
+            .complete_purge_with_storage(
+                &partition_config(),
+                &harness.storage,
+                NEW_GENERATION,
+                PURGE_CUTOFF,
+            )
             .await
             .expect("the purge at boot completes");
         drop(recovered);
@@ -664,6 +747,7 @@ fn given_unremovable_bookmark_when_power_is_lost_should_require_purge_before_fre
                         &partition_config(),
                         &harness.storage,
                         NEW_GENERATION,
+                        PURGE_CUTOFF,
                     )
                     .await;
                 assert!(
@@ -688,6 +772,7 @@ fn given_unremovable_bookmark_when_power_is_lost_should_require_purge_before_fre
                         &partition_config(),
                         &harness.storage,
                         NEW_GENERATION,
+                        PURGE_CUTOFF,
                     )
                     .await
                     .expect("restart must finish the same purge before accepting fresh history");
@@ -706,9 +791,7 @@ fn given_unremovable_bookmark_when_power_is_lost_should_require_purge_before_fre
                 harness.storage.crash(Crash::PowerLoss);
                 let recovered = harness.recover_partition().await;
                 assert_eq!(recovered.applied_purge_generation(), NEW_GENERATION);
-                harness
-                    .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
-                    .await;
+                Box::pin(harness.poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])).await;
             }
         }
     });
@@ -731,6 +814,7 @@ fn given_offset_scan_failure_when_purging_should_remove_live_paths_without_recor
                         &partition_config(),
                         &harness.storage,
                         NEW_GENERATION,
+                        PURGE_CUTOFF
                     )
                     .await,
                 Err(partitions::PurgeError::Unserviceable(_))
@@ -753,6 +837,88 @@ fn given_offset_scan_failure_when_purging_should_remove_live_paths_without_recor
                 recovered.durable_consumer_offset_count(ConsumerKind::Consumer),
                 0
             );
+        }
+    });
+}
+
+#[test]
+fn given_cleanup_io_failure_when_restarting_should_resume_without_false_completion() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            let baseline = PurgeStorageHarness::with_stored_progress(policy).await;
+            let mut partition = baseline.empty_partition();
+            baseline
+                .recover_progress(&mut partition, STORED_OFFSET)
+                .await;
+            baseline.storage.clear_trace();
+            partition
+                .complete_purge_with_storage(
+                    &partition_config(),
+                    &baseline.storage,
+                    NEW_GENERATION,
+                    PURGE_CUTOFF,
+                )
+                .await
+                .unwrap();
+            let trace = baseline.storage.trace();
+            assert_ne!(trace, [] as [StorageOperation; 0]);
+            for (cut, operation) in trace.iter().enumerate() {
+                for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
+                    for crash in [Crash::Process, Crash::PowerLoss] {
+                        let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+                        let mut partition = harness.empty_partition();
+                        harness
+                            .recover_progress(&mut partition, STORED_OFFSET)
+                            .await;
+                        harness.storage.fail_at(cut, mode);
+                        let result = partition
+                            .complete_purge_with_storage(
+                                &partition_config(),
+                                &harness.storage,
+                                NEW_GENERATION,
+                                PURGE_CUTOFF,
+                            )
+                            .await;
+                        let completed = result.is_ok();
+                        if completed {
+                            assert_eq!(*operation, StorageOperation::Unlink);
+                            assert_ne!(mode, FaultMode::Before);
+                        } else {
+                            assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
+                        }
+                        drop(partition);
+                        harness.storage.crash(crash);
+                        let mut recovered = harness.empty_partition();
+                        harness
+                            .recover_progress(&mut recovered, STORED_OFFSET)
+                            .await;
+                        if completed {
+                            assert_eq!(recovered.applied_purge_generation(), NEW_GENERATION);
+                            for consumer in consumers() {
+                                assert_eq!(recovered.get_consumer_offset(consumer), None);
+                            }
+                        }
+                        recovered
+                            .complete_purge_with_storage(
+                                &partition_config(),
+                                &harness.storage,
+                                NEW_GENERATION,
+                                PURGE_CUTOFF,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(recovered.purge_floor_op(), PURGE_CUTOFF);
+                        drop(recovered);
+                        harness.storage.crash(Crash::PowerLoss);
+                        let mut verified = harness.empty_partition();
+                        harness.recover_progress(&mut verified, STORED_OFFSET).await;
+                        assert_eq!(verified.applied_purge_generation(), NEW_GENERATION);
+                        for consumer in consumers() {
+                            assert_eq!(verified.get_consumer_offset(consumer), None);
+                        }
+                    }
+                }
+            }
         }
     });
 }
